@@ -5773,3 +5773,67 @@ fn run_mode_boxed_str_vec_sort_after_movement() {
         "rev=[\"plum\", \"apple\", \"kiwi\", \"pear\"]\nrev-sorted=[\"apple\", \"kiwi\", \"pear\", \"plum\"]\nrotl=[\"ape\", \"cat\", \"bee\", \"dog\"]\nrotl-sorted=[\"ape\", \"bee\", \"cat\", \"dog\"]\neq=true pcmp=Some(Equal) slice-eq=true\nbox-eq=true box-lt=false\n",
     );
 }
+const BOXED_STR_VEC_DEDUP_SRC: &str = r#"
+fn main() {
+    // `dedup` drops each duplicate element in place through
+    // a raw pointer into the buffer: for a fat element the
+    // compiler's `drop_glue` shim drops the pointee first and
+    // the box destructor's own body then prices the
+    // deallocation from the pointee's `size_of_val`, so the
+    // dropped storage must stay readable to the body while
+    // glue must find nothing left to drop.
+    let mut v: Vec<Box<str>> = vec!["pear".into(), "apple".into(), "apple".into(), "kiwi".into(), "pear".into()];
+    v.dedup();
+    println!("dedup={:?}", v);
+    let mut v: Vec<Box<str>> = vec!["a".into(), "a".into(), "a".into(), "b".into(), "a".into()];
+    v.dedup();
+    println!("dedup2={:?}", v);
+    let mut v: Vec<Box<[u8]>> = vec![vec![1u8, 2].into_boxed_slice(), vec![1u8, 2].into_boxed_slice(), vec![3u8].into_boxed_slice()];
+    v.dedup();
+    println!("dedup_u8={:?}", v);
+    let mut v: Vec<Box<[String]>> = vec![vec!["x".to_string()].into_boxed_slice(), vec!["x".to_string()].into_boxed_slice(), vec!["y".to_string()].into_boxed_slice()];
+    v.dedup();
+    println!("dedup_string_slice={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_str_vec_dedup() {
+    run_ok(
+        "boxed-str-vec-dedup",
+        BOXED_STR_VEC_DEDUP_SRC,
+        "dedup=[\"pear\", \"apple\", \"kiwi\", \"pear\"]\ndedup2=[\"a\", \"b\", \"a\"]\ndedup_u8=[[1, 2], [3]]\ndedup_string_slice=[[\"x\"], [\"y\"]]\n",
+    );
+}
+
+const DROP_IN_PLACE_FAT_BOX_SRC: &str = r#"
+fn main() {
+    // The bare shape dedup's machinery is built from:
+    // `drop_in_place` on a fat-box element through a raw
+    // pointer, then the tail shifted down over the slot.
+    let mut v: Vec<Box<str>> = vec!["apple".into(), "kiwi".into(), "pear".into()];
+    unsafe {
+        let p = v.as_mut_ptr();
+        std::ptr::drop_in_place(p.add(1));
+        std::ptr::copy(p.add(2), p.add(1), 1);
+        v.set_len(2);
+    }
+    println!("shifted={:?}", v);
+    let mut v: Vec<Box<[String]>> = vec![vec!["a".to_string(), "b".to_string()].into_boxed_slice(), vec!["c".to_string()].into_boxed_slice()];
+    unsafe {
+        let p = v.as_mut_ptr();
+        std::ptr::drop_in_place(p.add(1));
+        v.set_len(1);
+    }
+    println!("sliced={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_drop_in_place_fat_box_element() {
+    run_ok(
+        "drop-in-place-fat-box-element",
+        DROP_IN_PLACE_FAT_BOX_SRC,
+        "shifted=[\"apple\", \"pear\"]\nsliced=[[\"a\", \"b\"]]\n",
+    );
+}

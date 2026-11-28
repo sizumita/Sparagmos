@@ -470,6 +470,7 @@ impl<'a> Interpreter<'a> {
 
     pub(crate) fn free_alloc(&self, id: u64) {
         self.allocs.borrow_mut().remove(&id);
+        self.glue_dropped_allocs.borrow_mut().remove(&id);
         self.elem_blocks.borrow_mut().remove(&id);
         self.alloc_tys.borrow_mut().remove(&id);
     }

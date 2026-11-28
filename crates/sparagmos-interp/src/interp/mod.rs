@@ -958,6 +958,18 @@ pub struct Interpreter<'a> {
     /// outlives the call, as a leaked allocation does). Interior-
     /// mutable because most execution paths hold only `&self`.
     allocs: std::cell::RefCell<HashMap<u64, Value>>,
+    /// Allocations whose value a completed drop-glue session has
+    /// dropped through a pointer (see the session-completion
+    /// marking in `drop_glue`): the storage's value stays in
+    /// `allocs` -- a native drop leaves the bytes in place until
+    /// the free, and the owning box's destructor body still
+    /// reads the pointee's metadata (its `size_of_val`) on its
+    /// way to that free -- but drop glue reaching the same
+    /// allocation afterwards must find nothing left to drop a
+    /// second time, so glue reads (and only glue reads) treat a
+    /// recorded allocation as empty. Entries are removed when
+    /// the allocation is freed.
+    glue_dropped_allocs: std::cell::RefCell<std::collections::HashSet<u64>>,
     /// The reverse registry for synthetic addresses that denote
     /// an allocation in the store: a synthetic address (see
     /// [`synthetic_address`]) -> the allocation id it denotes.
@@ -1762,6 +1774,9 @@ impl<'a> Interpreter<'a> {
             va_lists: std::cell::RefCell::new(HashMap::new()),
             next_va_list: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
+            glue_dropped_allocs: std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            ),
             consumed_iter_final: std::cell::RefCell::new(None),
             address_owners: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
