@@ -1020,9 +1020,9 @@ impl<'a> Interpreter<'a> {
                 // through to the element.
                 if let Ok(resolved) = self.deref_value(frames, target) {
                     if let Ok(stored) = self.read_resolved(frames, &resolved) {
-                        if let Value::FatRef { base, .. } = &stored {
+                        if let Value::FatRef { base, len } = &stored {
                             if let Ok(bd) = self.deref_value(frames, base) {
-                                if target_ends_at_element(&bd) {
+                                if self.base_denotes_element_span(frames, &bd, *len) {
                                     return self.format_value(
                                         frames, &stored, *trait_, ty, options, 0,
                                     );
@@ -1036,9 +1036,9 @@ impl<'a> Interpreter<'a> {
                 // element: resolving it would read the element
                 // itself and lose the slice shape, so hand the fat
                 // pointer itself to the formatter.
-                if let Value::FatRef { base, .. } = &**target {
+                if let Value::FatRef { base, len } = &**target {
                     if let Ok(resolved) = self.deref_value(frames, base) {
-                        if target_ends_at_element(&resolved) {
+                        if self.base_denotes_element_span(frames, &resolved, *len) {
                             return self.format_value(
                                 frames, target, *trait_, ty, options, 0,
                             );
@@ -2223,7 +2223,7 @@ impl<'a> Interpreter<'a> {
                 return Ok(text);
             }
         }
-        if let Value::FatRef { base, .. } = value {
+        if let Value::FatRef { base, len } = value {
             // A slice value: only Debug is defined for it (a list).
             if trait_ != FmtTrait::Debug {
                 return Err(unsupported(format!(
@@ -2260,7 +2260,7 @@ impl<'a> Interpreter<'a> {
             // from that position (resolving it would read just the
             // element).
             if let Ok(resolved) = self.deref_value(frames, base) {
-                if target_ends_at_element(&resolved) {
+                if self.base_denotes_element_span(frames, &resolved, *len) {
                     return self.format_debug_seq(
                         frames, value, options, indent, '[', ']', elem,
                     );

@@ -381,20 +381,24 @@ impl<'a> Interpreter<'a> {
             // a container (an element-entry base: the string
             // view the `as_os_str` / `as_path` formations leave
             // over an owner's buffer, a raw-parts or sub-slice
-            // base over `container[i]`) denotes the span of its
-            // carried length from that element on, not the
-            // element itself: following the base would hand the
-            // caller the first element alone (a byte span of
-            // any length mistaken for its one first byte, the
+            // base over `container[i]`, an element entered
+            // through a wrapper's field steps by a `CStr`
+            // range index) denotes the span of its carried
+            // length from that element on, not the element
+            // itself: following the base would hand the caller
+            // the first element alone (a byte span of any
+            // length mistaken for its one first byte, the
             // defect pinned on #513). The pointer resolves to
             // itself, as the self-contained bases above do;
             // consumers that want the span's elements read
             // them through `slice_elements`, whose sibling
             // walk is built on exactly this reading.
             let follows = follows
-                && !matches!(&*cur, Value::FatRef { base, .. }
+                && !matches!(&*cur, Value::FatRef { base, len }
                     if self.deref_value(frames, base)
-                        .is_ok_and(|target| target_ends_at_element(&target)));
+                        .is_ok_and(|target| {
+                            self.base_denotes_element_span(frames, &target, *len)
+                        }));
             if !follows {
                 break;
             }
