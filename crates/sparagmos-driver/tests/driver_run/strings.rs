@@ -6092,3 +6092,49 @@ fn run_mode_os_string_byte_slice_debug_order_permutations() {
         "bytes=[107, 101, 121]\nbytes2=[107, 101, 121]\nfrom-enc=[107, 101, 121]\nbefore=3076200174974209401 after=3076200174974209401 same=true\nkey-enc=[107, 101, 121]\nget=Some(7)\n",
     );
 }
+
+const DEBUG_NO_PAD_SRC: &str = r#"
+fn main() {
+    let s = "abcde";
+    let owned = String::from("abcde");
+    println!("{:>10?}", s);
+    println!("{:<10?}", s);
+    println!("{:^10?}", s);
+    println!("{:*>10?}", s);
+    println!("{:>10?}", owned);
+    println!("{:>10?}", &owned);
+    println!("{:.3?}", s);
+    println!("{:>12.3?}", s);
+    println!("{:.0?}", s);
+    println!("{:05?}", s);
+    println!("{:>6?}", 'x');
+    println!("{:<6?}", 'x');
+    println!("{:.2?}", 'x');
+    println!("{:>10?}", '\n');
+    println!("{:>10}", s);
+    println!("{:.3}", s);
+    println!("{:>8?}", true);
+    println!("{:.2?}", true);
+    println!("{:>8?}", 42);
+    #[derive(Debug)]
+    struct W<'a> { f: &'a str }
+    println!("{:>16?}", W { f: s });
+}
+"#;
+
+#[test]
+fn run_mode_debug_str_char_ignore_width_and_precision() {
+    // core's `Debug for str` (and for `String`, which delegates
+    // to it) and `Debug for char` write the quoted, escaped text
+    // directly and never route through the padding machinery,
+    // so a width or precision in the spec changes nothing --
+    // unlike `Display` (which pads and truncates through
+    // `Formatter::pad`) and the `bool` / integer `Debug` impls
+    // (which pad), all of which the control lines pin. The
+    // expected text is native output.
+    run_ok(
+        "dbgnopad",
+        DEBUG_NO_PAD_SRC,
+        "\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n'x'\n'x'\n'x'\n'\\n'\n     abcde\nabc\n    true\ntr\n      42\nW { f: \"abcde\" }\n",
+    );
+}
