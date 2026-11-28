@@ -3114,7 +3114,13 @@ impl<'a> Interpreter<'a> {
                 Some(debug_struct_text(
                     "Os",
                     &[
-                        ("code", code.to_string()),
+                        // The `code` field is an `i32` the
+                        // builder formats with the caller's own
+                        // spec, like any composed field.
+                        (
+                            "code",
+                            format_int_radix(code as i128, Some("i32"), 10, "", options),
+                        ),
                         ("kind", kind.to_string()),
                         ("message", format!("\"{}\"", os_error_message(code))),
                     ],
@@ -3641,8 +3647,10 @@ impl<'a> Interpreter<'a> {
         indent: usize,
     ) -> InterpResult<String> {
         match value {
-            // The unit value's Debug (and Display) text is `()`.
-            Value::Unit => Ok("()".to_string()),
+            // The unit value's Debug text is `()`, written
+            // through core's pad machinery: a width pads it and
+            // a precision truncates it, as for a `Display` text.
+            Value::Unit => Ok(pad_str("()", options)),
             Value::Int(v) => {
                 if options.flags & DEBUG_LOWER_HEX != 0 {
                     Ok(format_int_radix(*v, Some(ty), 16, "0x", options))
@@ -4267,13 +4275,16 @@ impl<'a> Interpreter<'a> {
         let head = tag.split('<').next().unwrap_or(tag).trim();
         match head {
             "core::cell::UnsafeCell" | "std::cell::UnsafeCell" => {
-                // The impl is non-exhaustive by design.
-                return Ok(pad_width("UnsafeCell { .. }", options));
+                // The impl is non-exhaustive by design; the
+                // builder writes the text directly, so a width
+                // spec leaves it unpadded.
+                return Ok("UnsafeCell { .. }".to_string());
             }
             "core::marker::PhantomData" | "std::marker::PhantomData" => {
-                // The impl prints the type parameter it carries.
+                // The impl prints the type parameter it carries,
+                // written directly (a width spec does not pad it).
                 let arg = first_generic_arg(tag).unwrap_or("");
-                return Ok(pad_width(&format!("PhantomData<{arg}>"), options));
+                return Ok(format!("PhantomData<{arg}>"));
             }
             "core::asserting::Capture" => {
                 // The handwritten `Debug` of the `assert!`
@@ -4346,7 +4357,7 @@ impl<'a> Interpreter<'a> {
                         stored
                     };
                     if borrowed {
-                        return Ok(pad_width("RefCell { value: <borrowed> }", options));
+                        return Ok("RefCell { value: <borrowed> }".to_string());
                     }
                     if let Some(inner) = unwrap_one(&stored) {
                         let elem = first_generic_arg(tag).unwrap_or("");
@@ -4372,13 +4383,10 @@ impl<'a> Interpreter<'a> {
                             &inner,
                             FmtTrait::Debug,
                             elem,
-                            &FmtOptions::new(),
+                            options,
                             indent,
                         )?;
-                        return Ok(pad_width(
-                            &format!("RefCell {{ value: {text} }}"),
-                            options,
-                        ));
+                        return Ok(format!("RefCell {{ value: {text} }}"));
                     }
                 }
             }
@@ -4423,10 +4431,10 @@ impl<'a> Interpreter<'a> {
                         &inner,
                         FmtTrait::Debug,
                         elem,
-                        &FmtOptions::new(),
+                        options,
                         indent,
                     )?;
-                    return Ok(pad_width(&format!("Cell {{ value: {text} }}"), options));
+                    return Ok(format!("Cell {{ value: {text} }}"));
                 }
             }
             _ => {}
@@ -4471,11 +4479,16 @@ impl<'a> Interpreter<'a> {
             _ => None,
         };
         if let Some(text) = range_text {
-            return Ok(pad_width(&text, options));
+            // The operands already received the caller's options
+            // (see `format_range_operand`); the composed text is
+            // written directly, never padded as a whole.
+            return Ok(text);
         }
         let name = variant_shape.name.as_str();
         if fields.is_empty() {
-            return Ok(pad_width(name, options));
+            // A fieldless variant (or struct) prints its name
+            // directly: a width spec does not pad it.
+            return Ok(name.to_string());
         }
         let named = variant_shape.fields.iter().all(|f| f.name.is_some());
         if options.alternate() {
@@ -4504,6 +4517,10 @@ impl<'a> Interpreter<'a> {
             out.push(if named { '}' } else { ')' });
             return Ok(out);
         }
+        // The compact composition propagates the caller's
+        // options to every field, as the derived impl passes
+        // the formatter itself to each field; the composed
+        // body is never padded as a whole.
         let mut parts = Vec::with_capacity(fields.len());
         for (field, value) in variant_shape.fields.iter().zip(fields) {
             let text = self.format_value(
@@ -4511,7 +4528,7 @@ impl<'a> Interpreter<'a> {
                 value,
                 FmtTrait::Debug,
                 &field.ty,
-                &FmtOptions::new(),
+                options,
                 indent,
             )?;
             match &field.name {
@@ -4524,7 +4541,7 @@ impl<'a> Interpreter<'a> {
         } else {
             format!("{name}({})", parts.join(", "))
         };
-        Ok(pad_width(&body, options))
+        Ok(body)
     }
 
     /// `Debug` for a std map/set collection value, composed
@@ -4630,6 +4647,9 @@ impl<'a> Interpreter<'a> {
             out.push('}');
             return Ok(out);
         }
+        // As in the sequence composition, the caller's options
+        // propagate to every key and value; the entry body is
+        // not padded as a whole.
         let mut parts = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             let key_text = self.format_value(
@@ -4637,7 +4657,7 @@ impl<'a> Interpreter<'a> {
                 key,
                 FmtTrait::Debug,
                 key_ty,
-                &FmtOptions::new(),
+                options,
                 indent,
             )?;
             let value_text = self.format_value(
@@ -4645,12 +4665,12 @@ impl<'a> Interpreter<'a> {
                 value,
                 FmtTrait::Debug,
                 val_ty,
-                &FmtOptions::new(),
+                options,
                 indent,
             )?;
             parts.push(format!("{key_text}: {value_text}"));
         }
-        Ok(pad_width(&format!("{{{}}}", parts.join(", ")), options))
+        Ok(format!("{{{}}}", parts.join(", ")))
     }
 
     /// Debug formatting of a tuple or slice value: `(a, b)` / `[a, b]`,
@@ -4807,6 +4827,12 @@ impl<'a> Interpreter<'a> {
             out.push(close);
             return Ok(out);
         }
+        // The compact composition propagates the caller's
+        // options to every element, as core's Debug builders
+        // pass the formatter itself to each field: an element
+        // whose own impl honours the spec pads (or truncates)
+        // itself, and the composed body is never padded as a
+        // whole.
         let mut parts = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
             parts.push(self.format_value(
@@ -4814,7 +4840,7 @@ impl<'a> Interpreter<'a> {
                 item,
                 FmtTrait::Debug,
                 elem_tys.get(i).copied().unwrap_or(""),
-                &FmtOptions::new(),
+                options,
                 indent,
             )?);
         }
@@ -4823,7 +4849,7 @@ impl<'a> Interpreter<'a> {
         } else {
             format!("{open}{}{close}", parts.join(", "))
         };
-        Ok(pad_width(&body, options))
+        Ok(body)
     }
 }
 
@@ -4989,7 +5015,10 @@ fn debug_struct_text(
         .iter()
         .map(|(field_name, text)| format!("{field_name}: {text}"))
         .collect();
-    pad_width(&format!("{name} {{ {} }}", parts.join(", ")), options)
+    // The field texts are pre-rendered by the caller (with the
+    // caller's options already applied to them, as a builder
+    // would); the composed body is not padded as a whole.
+    format!("{name} {{ {} }}", parts.join(", "))
 }
 
 /// `Debug` rendering of a tuple struct with pre-rendered item
@@ -5011,7 +5040,9 @@ fn debug_tuple_text(name: &str, items: &[String], options: &FmtOptions, indent: 
         out.push(')');
         return out;
     }
-    pad_width(&format!("{name}({})", items.join(", ")), options)
+    // As in `debug_struct_text`, the item texts are
+    // pre-rendered and the composed body is not padded whole.
+    format!("{name}({})", items.join(", "))
 }
 
 /// The octets an `Ipv4Addr` value holds, through whichever

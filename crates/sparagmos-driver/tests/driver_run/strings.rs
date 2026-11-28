@@ -6121,6 +6121,74 @@ fn main() {
     println!("{:>16?}", W { f: s });
 }
 "#;
+const COMPOSITE_DEBUG_WIDTH_SRC: &str = r#"use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
+
+#[derive(Debug)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+#[derive(Debug)]
+struct Unit;
+
+fn main() {
+    println!("{:>16?}", (3, 4));
+    println!("{:<16?}", (3, 4));
+    println!("{:^16?}", (3, 4));
+    println!("{:*>12?}", (3, 4));
+    println!("{:>16?}", (3,));
+    println!("{:>16?}", ((1, 2), 3));
+    println!("{:>12?}", (true, 5));
+    println!("{:.2?}", (3.14159f64, 2.71828f64));
+    println!("{:>16?}", vec![1, 2]);
+    println!("{:>10?}", vec![vec![1, 2], vec![3]]);
+    println!("{:>12?}", [1, 2, 3]);
+    println!("{:>12?}", &[1, 2, 3][..]);
+    println!("{:>8?}", Some(42));
+    println!("{:>8?}", None::<i32>);
+    println!("{:>12?}", (Some(3), None::<i32>));
+    println!("{:>10?}", Ok::<i32, i32>(5));
+    println!("{:>10?}", Err::<i32, i32>(7));
+    println!("{:>8?}", 1..3);
+    println!("{:>10?}", 1..=3);
+    println!("{:>8?}", 1..);
+    println!("{:>8?}", ..3);
+    println!("{:>8?}", ..);
+    let mut m = BTreeMap::new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    println!("{:>14?}", m);
+    let mut s = BTreeSet::new();
+    s.insert(1);
+    s.insert(2);
+    println!("{:>12?}", s);
+    println!("{:>22?}", Cell::new(5));
+    println!("{:>26?}", RefCell::new(5));
+    println!("{:>14?}", Box::new((1, 2)));
+    println!("{:>20?}", PhantomData::<i32>);
+    println!("{:.3?}", PhantomData::<i32>);
+    println!("{:>20?}", UnsafeCell::new(5));
+    let err = std::fs::File::open("/nonexistent-dir-xyz/file").unwrap_err();
+    println!("{:>40?}", err);
+    println!("{:06?}", (1, 2));
+    println!("{:+?}", (1, -2));
+    println!("{:>8?}", (1..3, 4));
+    println!("{:.3?}", vec![1.5f64, 2.25f64]);
+    println!("{:>4?}", (100, 2));
+    let mut m2 = BTreeMap::new();
+    m2.insert(1, 2);
+    println!("{:>18?}", (m2, 3));
+    println!("{:<14?}", vec![7, 8]);
+    println!("{:>12?}", std::io::empty());
+    let rc = RefCell::new(5);
+    let _b = rc.borrow_mut();
+    println!("{:>30?}", rc);
+    println!("{:>24?}", Point { x: 1, y: 2 });
+    println!("{:>8?}", Unit);
+}
+"#;
 
 #[test]
 fn run_mode_debug_str_char_ignore_width_and_precision() {
@@ -6136,5 +6204,117 @@ fn run_mode_debug_str_char_ignore_width_and_precision() {
         "dbgnopad",
         DEBUG_NO_PAD_SRC,
         "\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n\"abcde\"\n'x'\n'x'\n'x'\n'\\n'\n     abcde\nabc\n    true\ntr\n      42\nW { f: \"abcde\" }\n",
+    );
+}
+#[test]
+fn run_mode_debug_composite_width_propagates_to_fields() {
+    // A width/alignment/fill/sign/precision spec on a composite
+    // value reaches every field, as core's Debug builders pass
+    // the formatter itself to the fields: each field's own impl
+    // applies the spec, and the composed body is never padded
+    // as a whole. Fixed texts a builder writes directly (a
+    // fieldless variant's name, `..`, `PhantomData<_>`,
+    // `UnsafeCell { .. }`) stay unpadded; the `io::Error` `Os`
+    // form's `code` field honours the spec like any field. The
+    // expected text is native output.
+    let dir = temp_dir("dbgcomp");
+    let src = fixture(&dir, "composite.rs", COMPOSITE_DEBUG_WIDTH_SRC);
+    let out = run_driver_with_aux_specs(&src, Some("2021"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "composite Debug guests must format; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"(               3,                4)
+(3               , 4               )
+(       3        ,        4        )
+(***********3, ***********4)
+(               3,)
+((               1,                2),                3)
+(        true,            5)
+(3.14, 2.72)
+[               1,                2]
+[[         1,          2], [         3]]
+[           1,            2,            3]
+[           1,            2,            3]
+Some(      42)
+None
+(Some(           3), None)
+Ok(         5)
+Err(         7)
+       1..       3
+         1..=         3
+       1..
+..       3
+..
+{             1:             10,              2:             20}
+{           1,            2}
+Cell { value:                      5 }
+RefCell { value:                          5 }
+(             1,              2)
+PhantomData<i32>
+PhantomData<i32>
+UnsafeCell { .. }
+Os { code:                                        2, kind: NotFound, message: "No such file or directory" }
+(000001, 000002)
+(+1, -2)
+(       1..       3,        4)
+[1.500, 2.250]
+( 100,    2)
+({                 1:                  2},                  3)
+[7             , 8             ]
+Empty
+RefCell { value: <borrowed> }
+Point { x:                        1, y:                        2 }
+Unit
+"#,
+        "composite Debug output matches native"
+    );
+}
+
+const UNIT_DEBUG_WIDTH_SRC: &str = r#"fn main() {
+    println!("{:>8?}", ());
+    println!("{:<8?}", ());
+    println!("{:^8?}", ());
+    println!("{:.1?}", ());
+    println!("{:.5?}", ());
+    println!("{:>6.1?}", ());
+    println!("{:>12?}", ((), 5));
+    println!("{:>6?}", vec![(), ()]);
+    println!("{:>10?}", Some(()));
+}
+"#;
+
+#[test]
+fn run_mode_debug_unit_pads_and_truncates() {
+    // The unit value's Debug goes through core's pad
+    // machinery: a width pads `()` and a precision truncates
+    // it, standalone and as a composite element. The expected
+    // text is native output.
+    let dir = temp_dir("dbgunit");
+    let src = fixture(&dir, "unit.rs", UNIT_DEBUG_WIDTH_SRC);
+    let out = run_driver_with_aux_specs(&src, Some("2021"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unit Debug guests must format; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"      ()
+()      
+   ()   
+(
+()
+     (
+(          (),            5)
+[    (),     ()]
+Some(        ())
+"#,
+        "unit Debug output matches native"
     );
 }
