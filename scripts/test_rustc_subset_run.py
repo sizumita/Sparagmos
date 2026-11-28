@@ -2943,6 +2943,44 @@ class ConvertSideTests(unittest.TestCase):
         argv, out = self.run_argv()
         self.assertNotIn("--compiletest-check-mode", argv)
 
+    def run_env(self, **kw):
+        orig = run.run_cmd
+        seen = []
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=(), mem_limit_mb=None):
+            seen.append(env_extra)
+            return {"exit_code": 0, "timeout": False,
+                    "stdout": "converted: 1, skipped: 0\n",
+                    "stderr": ""}
+
+        run.run_cmd = stub
+        try:
+            out = run.convert_side(Path("t.rs"), "2021",
+                                   Path("/fake/driver"), **kw)
+        finally:
+            run.run_cmd = orig
+        return seen[0], out
+
+    def test_convert_env_carries_driver_library_path(self):
+        # The driver links the toolchain's shared rustc_driver
+        # library; on Windows the loader resolves it through
+        # PATH, so a convert invocation must put the sysroot
+        # lib dir on the child's library path exactly as the
+        # run side does -- without it the staged driver cannot
+        # start on a Windows host at all (exit 3221225781,
+        # STATUS_DLL_NOT_FOUND).
+        orig_lib, orig_facts = run.sysroot_lib, run.host_facts
+        run.sysroot_lib = lambda: "/tc/lib"
+        run.host_facts = lambda: None
+        try:
+            with unittest.mock.patch.dict(
+                    os.environ, {"LD_LIBRARY_PATH": "/prev"}):
+                env, out = self.run_env()
+        finally:
+            run.sysroot_lib, run.host_facts = orig_lib, orig_facts
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/tc/lib:/prev")
+
     def test_not_demanded_lines_are_parsed(self):
         out = self.run_stdout(
             "sparagmos-driver: t.rs (Stable MIR, 1.100.0)\n"
@@ -3058,6 +3096,43 @@ class ConvertSideTests(unittest.TestCase):
         stamped = run.stamp_revision_cfg(specs, "with-diag-in-deps")
         self.assertEqual([sp.cfg for sp in stamped],
                          ["with_diag_in_deps", "with_diag_in_deps"])
+
+
+class DebugSideTests(unittest.TestCase):
+    """sparagmos_debug_side's driver env (run_cmd stubbed)."""
+
+    def test_debug_env_carries_driver_library_path(self):
+        # Same obligation as convert_side: the staged driver
+        # links the toolchain's shared rustc_driver library,
+        # which the Windows loader resolves through PATH; a
+        # debug invocation without the sysroot lib dir cannot
+        # start the driver on a Windows host (exit 3221225781,
+        # STATUS_DLL_NOT_FOUND).
+        orig = run.run_cmd
+        orig_lib, orig_facts = run.sysroot_lib, run.host_facts
+        seen = []
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=(), mem_limit_mb=None):
+            seen.append(env_extra)
+            return {"exit_code": 0, "timeout": False,
+                    "stdout": "", "stderr": ""}
+
+        run.run_cmd = stub
+        run.sysroot_lib = lambda: "/tc/lib"
+        run.host_facts = lambda: None
+        try:
+            with unittest.mock.patch.dict(
+                    os.environ, {"LD_LIBRARY_PATH": "/prev"}):
+                out = run.sparagmos_debug_side(
+                    Path("t.rs"), "2021", Path("/fake/driver"),
+                    "gdb", "run\n")
+        finally:
+            run.run_cmd = orig
+            run.sysroot_lib, run.host_facts = orig_lib, orig_facts
+        self.assertEqual(out[1], "result")
+        self.assertEqual(seen[0]["LD_LIBRARY_PATH"],
+                         "/tc/lib:/prev")
 
 
 class ProcessStage2AuxTests(unittest.TestCase):
