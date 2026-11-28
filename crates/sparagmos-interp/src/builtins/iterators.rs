@@ -3672,8 +3672,11 @@ impl<'a> Interpreter<'a> {
         arg: &Value,
         elems: &[Value],
     ) -> Option<Value> {
-        let first = self.iter_mut_element_ref(frames, arg, 0).ok()?;
-        let end = self.iter_mut_element_ref(frames, arg, elems.len()).ok()?;
+        let first =
+            respell_field_element_step(&self.iter_mut_element_ref(frames, arg, 0).ok()?);
+        let end = respell_field_element_step(
+            &self.iter_mut_element_ref(frames, arg, elems.len()).ok()?,
+        );
         // The step machinery locates a pointer's element step
         // with `elem_step_pos`, which reads a trailing entry
         // step as part of the element the earlier steps denote:
@@ -3682,22 +3685,36 @@ impl<'a> Interpreter<'a> {
         // produce a projection whose own element step the
         // machinery would locate at the outer sequence's step
         // instead, and stepping such a state would walk the
-        // outer sequence. A field-step element position is
-        // ambiguous in the same way for the pointer-offset
-        // machinery: a lone `Field(0)` over a field-stored
-        // element sequence reads there as the sequence's base
-        // field, so an offset appends an index step behind it
-        // instead of advancing the field step, and the
-        // resulting projection denotes a position inside the
-        // first element. A byte-displaced position (a regrouped
+        // outer sequence. A byte-displaced position (a regrouped
         // view's element) is out for the same reason the step
         // machinery's index-pair shortcut excludes it: reading
         // drops the displacement, so the position belongs to
         // the real-pointer step. Adopt the state only when both
-        // built positions carry an index element step the
-        // machinery reads back as the position it denotes, as
-        // the final step of the projection, with no byte
-        // displacement anywhere in the projection.
+        // built positions carry an element step the machinery
+        // reads back as the position it denotes, as the final
+        // step of the projection, with no byte displacement
+        // anywhere in the projection.
+        //
+        // The element step may arrive as a field step: the
+        // form `iter_mut_element_ref` builds over an element
+        // aggregate (an ADT value whose fields are its
+        // elements -- the `vec!` literal's `Vec` form, whose
+        // elements the conversion leaves in the aggregate).
+        // Over such an aggregate the two steps denote the
+        // same element -- the projectors read and write an
+        // index step over an ADT value as its element field --
+        // so the built positions are re-spelled with the
+        // index step (`respell_field_element_step`) before
+        // any check runs. The index spelling is the one every
+        // consumer of an element position composes, the
+        // fat-pointer element composition an `as_slice`
+        // result goes through above all: there a field step
+        // reads as the sequence's base field, and an index
+        // appended behind it would land inside the first
+        // element. The read-back checks below are the
+        // evidence that the re-spelled positions denote the
+        // snapshot's elements: a position that reads back
+        // differently declines the state.
         let denotes = |v: &Value, idx: usize| -> bool {
             let projection = match v {
                 Value::Ref(RefTarget::Place { projection, .. })
@@ -3726,9 +3743,11 @@ impl<'a> Interpreter<'a> {
             if read_back(0, &first) != Some(true) {
                 return None;
             }
-            let last = self
-                .iter_mut_element_ref(frames, arg, elems.len() - 1)
-                .ok()?;
+            let last = respell_field_element_step(
+                &self
+                    .iter_mut_element_ref(frames, arg, elems.len() - 1)
+                    .ok()?,
+            );
             if read_back(elems.len() - 1, &last) != Some(true) {
                 return None;
             }
@@ -8606,6 +8625,55 @@ fn iter_ptr_with_index(value: &Value, idx: usize) -> Option<Value> {
             with_index(projection, idx)?,
         ))),
         _ => None,
+    }
+}
+
+/// The same element pointer with a trailing field element
+/// step re-spelled as an index step, when that step is the
+/// projection's element step (see `elem_step_pos`): over an
+/// element aggregate (an ADT value whose fields are its
+/// elements) the two spellings denote the same element, and
+/// the index spelling is the one the consumers of an element
+/// position compose. A pointer in any other shape is returned
+/// unchanged.
+fn respell_field_element_step(value: &Value) -> Value {
+    fn respelt(projection: &[RefProj]) -> Vec<RefProj> {
+        let mut projection = projection.to_vec();
+        if elem_step_pos(&projection)
+            == Some(projection.len().saturating_sub(1))
+        {
+            if let Some(RefProj::Field(f)) = projection.last() {
+                let f = *f;
+                let last = projection.len() - 1;
+                projection[last] = RefProj::Index(f);
+            }
+        }
+        projection
+    }
+    match value {
+        Value::Ref(RefTarget::Place {
+            frame,
+            local,
+            projection,
+        }) => Value::Ref(RefTarget::place(
+            *frame,
+            *local,
+            respelt(projection),
+        )),
+        Value::Ref(RefTarget::Static { name, projection }) => {
+            Value::Ref(RefTarget::Static {
+                name: name.clone(),
+                projection: respelt(projection),
+            })
+        }
+        Value::Ref(RefTarget::Alloc { id, projection }) => Value::Ref(RefTarget::Alloc {
+            id: *id,
+            projection: respelt(projection),
+        }),
+        Value::Ref(RefTarget::Value(v, projection)) => {
+            Value::Ref(RefTarget::Value(v.clone(), respelt(projection)))
+        }
+        _ => value.clone(),
     }
 }
 
