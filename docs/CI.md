@@ -68,7 +68,10 @@ serialised repository-wide (one at a time).
 ### Official Measurement (`.github/workflows/official-measure.yml`)
 
 The full official measurement over the whole 24,937-record
-denominator. Runs on every push to `main` and on manual dispatch.
+denominator. Runs on every push to `main`, on a two-hourly
+schedule, and on manual dispatch. The JIT pass (metric 4) runs
+on push and schedule runs, and on dispatch runs when the
+`run_jit` input is set.
 
 - The survey (`scripts/rustc-subset-survey.py`) classifies the
   Rust 1.100.0 test suite; the source tree and the survey JSON are
