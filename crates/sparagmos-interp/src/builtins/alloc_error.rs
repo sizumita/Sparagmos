@@ -38,6 +38,21 @@
 //! by alloc's `capacity_overflow` fn (its own location is
 //! what std reports), and `AllocError { layout }` forwards
 //! to `handle_alloc_error`.
+//!
+//! Two more body-less allocation-path functions are served
+//! here. `Layout::from_size_alignment_unchecked` (and its
+//! `usize`-alignment sibling `from_size_align_unchecked`)
+//! are `#[rustc_const_stable]` constructors with no Stable
+//! MIR body; the collected bodies of the checked `Layout`
+//! constructors and of `for_value` / `array` / `pad_to_align`
+//! bottom out in them, so the model is the construction
+//! itself. And hashbrown's `Fallibility::capacity_overflow`
+//! -- the method std's hash-table growth calls when the
+//! bucket count overflows -- matches on the fallibility:
+//! `Fallible` answers the `CapacityOverflow` error value,
+//! `Infallible` panics with `Hash table capacity overflow`
+//! (the `panic!` at hashbrown's src/raw.rs:36 in the pinned
+//! build's vendored 0.17.1).
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{Frame, Interpreter, PanicOrigin};
@@ -120,6 +135,109 @@ impl<'a> Interpreter<'a> {
             _ => Err(InterpError::type_mismatch(
                 "alloc::raw_vec::handle_error",
                 "a TryReserveErrorKind variant (0 or 1)",
+                format!("variant {variant}"),
+            )),
+        }
+    }
+
+    /// `Layout::from_size_alignment_unchecked(size,
+    /// alignment) -> Layout` and `Layout::
+    /// from_size_align_unchecked(size, align) -> Layout`:
+    /// the construction itself. The `Alignment` argument is
+    /// already a `Layout` align field, so it passes through
+    /// unchanged; a plain `usize` alignment is wrapped the
+    /// way every fabricated `Layout` in this model wraps it
+    /// (`alignment_value`).
+    pub(crate) fn exec_layout_from_size_align_unchecked(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        size: &Value,
+        align: &Value,
+    ) -> InterpResult<Value> {
+        let size = self.resolve_value(frames, size)?;
+        let align = self.resolve_value(frames, align)?;
+        let size = match size {
+            Value::Uint(n) => n,
+            Value::Int(n) if n >= 0 => n as u128,
+            ref other => {
+                return Err(InterpError::type_mismatch(
+                    "Layout::from_size_align_unchecked",
+                    "a size (usize)",
+                    other.kind_name(),
+                ));
+            }
+        };
+        let align_field = match align {
+            Value::Uint(n) => crate::interp::alignment_value(n),
+            Value::Int(n) if n >= 0 => crate::interp::alignment_value(n as u128),
+            other => other,
+        };
+        Ok(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(size), align_field],
+        })
+    }
+
+    /// `hashbrown::raw::Fallibility::capacity_overflow(
+    /// self) -> TryReserveError`: the match on the
+    /// fallibility described in the module docs. The
+    /// `Fallible` answer is the `TryReserveError` value in
+    /// the form the other reserve models produce (see
+    /// `VecTryReserve`'s error case).
+    pub(crate) fn exec_hashbrown_capacity_overflow(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        fallibility: &Value,
+    ) -> InterpResult<Value> {
+        let fallibility = self.resolve_value(frames, fallibility)?;
+        let variant = match fallibility {
+            Value::Enum { variant, .. } => variant,
+            Value::Uint(n) => n as u32,
+            Value::Int(n) if n >= 0 => n as u32,
+            ref other => {
+                return Err(InterpError::type_mismatch(
+                    "hashbrown::raw::Fallibility::capacity_overflow",
+                    "a Fallibility value",
+                    other.kind_name(),
+                ));
+            }
+        };
+        match variant {
+            // `Fallible => TryReserveError::CapacityOverflow`.
+            0 => Ok(Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            }),
+            // `Infallible => panic!("Hash table capacity
+            // overflow")`: the panic's own location is what
+            // std reports (hashbrown 0.17.1, src/raw.rs:36:40
+            // in the pinned build's vendored copy, in the
+            // `/rustc/<hash>` remapped spelling).
+            1 => {
+                if self.panic_location().is_none() {
+                    self.note_panic_stamp(Value::Ref(RefTarget::value(
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![
+                                Value::Str(
+                                    "/rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/vendor/hashbrown-0.17.1/src/raw.rs"
+                                        .to_string(),
+                                ),
+                                Value::Uint(36),
+                                Value::Uint(40),
+                            ],
+                        },
+                    )));
+                }
+                self.note_panic_origin(PanicOrigin::PanicFn);
+                self.note_panic_no_backtrace(false);
+                Err(InterpError::panic_str_payload(
+                    "Hash table capacity overflow",
+                ))
+            }
+            _ => Err(InterpError::type_mismatch(
+                "hashbrown::raw::Fallibility::capacity_overflow",
+                "a Fallibility variant (0 or 1)",
                 format!("variant {variant}"),
             )),
         }
@@ -379,6 +497,17 @@ pub(crate) fn alloc_lookup(canonical: &str) -> Option<Builtin> {
             Builtin::HandleAllocError
         }
         "alloc::raw_vec::handle_error" => Builtin::RawVecHandleError,
+        "core::alloc::Layout::from_size_alignment_unchecked"
+        | "alloc::alloc::Layout::from_size_alignment_unchecked"
+        | "std::alloc::Layout::from_size_alignment_unchecked"
+        | "core::alloc::Layout::from_size_align_unchecked"
+        | "alloc::alloc::Layout::from_size_align_unchecked"
+        | "std::alloc::Layout::from_size_align_unchecked" => {
+            Builtin::LayoutFromSizeAlignUnchecked
+        }
+        "hashbrown::raw::Fallibility::capacity_overflow" => {
+            Builtin::HashbrownCapacityOverflow
+        }
         "std::alloc::set_alloc_error_hook" => Builtin::AllocErrorHookSet,
         "std::alloc::take_alloc_error_hook" => Builtin::AllocErrorHookTake,
         "std::alloc::default_alloc_error_hook" => Builtin::AllocErrorDefaultHook,

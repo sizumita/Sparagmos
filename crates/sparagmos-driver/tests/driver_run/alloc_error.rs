@@ -245,3 +245,79 @@ fn run_mode_alloc_error_hook_default_hook_reports_and_aborts() {
         "the default hook reports the failed size: {stderr}"
     );
 }
+
+// ----- body-less allocation-path functions (`Layout` unchecked
+// constructors, hashbrown `Fallibility::capacity_overflow`) --
+//
+// `Layout::from_size_alignment_unchecked` /
+// `from_size_align_unchecked` are `#[rustc_const_stable]`
+// constructors with no Stable MIR body; the collected bodies of
+// the other `Layout` constructors bottom out in them.
+// `hashbrown::raw::Fallibility::capacity_overflow` is likewise
+// body-less: std's hash-table growth calls it when the bucket
+// count overflows. The interpreter models both in the builtin
+// path (`builtins::alloc_error`).
+
+const LAYOUT_UNCHECKED_SRC: &str = r#"
+use std::alloc::{alloc, dealloc, Layout};
+fn main() {
+    unsafe {
+        let layout = Layout::from_size_align_unchecked(24, 8);
+        assert_eq!(layout.size(), 24);
+        assert_eq!(layout.align(), 8);
+        let ptr = alloc(layout);
+        assert!(!ptr.is_null());
+        ptr.write_bytes(7, 24);
+        assert_eq!(*ptr, 7);
+        dealloc(ptr, layout);
+        // The `Alignment` form, reached through the collected
+        // body of `Layout::for_value`.
+        let value = [1u64, 2, 3];
+        let layout2 = Layout::for_value(&value);
+        assert_eq!(layout2.size(), 24);
+        assert_eq!(layout2.align(), 8);
+        // `pad_to_align` also bottoms out in the unchecked
+        // constructor.
+        let padded = Layout::from_size_align(5, 4).unwrap().pad_to_align();
+        assert_eq!(padded.size(), 8);
+        assert_eq!(padded.align(), 4);
+    }
+    println!("layout unchecked ok");
+}
+"#;
+
+#[test]
+fn run_mode_layout_unchecked_constructors_build_layouts() {
+    run_ok(
+        "layout-unchecked",
+        LAYOUT_UNCHECKED_SRC,
+        "layout unchecked ok\n",
+    );
+}
+
+const HASHMAP_CAPACITY_OVERFLOW_SRC: &str = r#"
+use std::collections::HashMap;
+use std::mem::size_of;
+fn main() {
+    let threshold = usize::MAX / size_of::<(u64, u64, u64)>();
+    let mut h = HashMap::<u64, u64>::with_capacity(threshold + 100);
+    h.insert(0, 0);
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_capacity_overflow_panics() {
+    let dir = temp_dir("hashmap-capacity-overflow");
+    let src = fixture(&dir, "capacity.rs", HASHMAP_CAPACITY_OVERFLOW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "hash table capacity overflow is a guest panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("capacity overflow"),
+        "the panic payload is the capacity-overflow message: {stderr}"
+    );
+}

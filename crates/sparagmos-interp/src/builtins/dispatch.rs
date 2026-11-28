@@ -7143,6 +7143,16 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 self.exec_raw_vec_handle_error(frames, &vals[0])
             }
+            Builtin::LayoutFromSizeAlignUnchecked => {
+                arity(2)?;
+                self.exec_layout_from_size_align_unchecked(
+                    frames, &vals[0], &vals[1],
+                )
+            }
+            Builtin::HashbrownCapacityOverflow => {
+                arity(1)?;
+                self.exec_hashbrown_capacity_overflow(frames, &vals[0])
+            }
             Builtin::AllocErrorHookSet => {
                 arity(1)?;
                 self.set_alloc_error_hook(vals[0].clone());
