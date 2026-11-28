@@ -9,3 +9,4 @@ include!("error.rs");
 include!("write.rs");
 include!("stdin.rs");
 include!("misc.rs");
+include!("output_capture.rs");

@@ -235,6 +235,14 @@ pub enum Builtin {
     /// in `interp.rs`), so reads through it -- and through its
     /// lock -- are the file model's reads.
     Stdin,
+    /// `std::io::set_output_capture(Option<LocalOutput>) ->
+    /// Option<LocalOutput>`: install the calling thread's
+    /// output capture -- the `Arc<Mutex<Vec<u8>>>` std's
+    /// `print_to` (the `_print` / `_eprint` path) and the
+    /// default panic report write into instead of the
+    /// standard streams while it is installed -- and return
+    /// the capture it replaces (`None` when there was none).
+    IoSetOutputCapture,
     /// `std::io::Stdout::lock` / `std::io::Stderr::lock`: the
     /// locked handle. The lock value is the handle itself in this
     /// model: writes through it are modelled by the `Write`

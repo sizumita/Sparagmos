@@ -94,7 +94,7 @@ impl<'a> Interpreter<'a> {
                     out.push_str(&format!("panicked:\n{msg}\n"));
                 }
                 out.push_str("thread panicked while processing panic. aborting.\n");
-                self.push_error_output(&out);
+                self.push_error_output_captured(frames, &out);
                 self.hook_abort.set(true);
             }
             return;
@@ -833,14 +833,15 @@ thread '{name}' ({tid}) panicked:
             ReportBacktrace::Off => {
                 if !self.panic_note_spent.get() {
                     self.panic_note_spent.set(true);
-                    self.push_error_output(
+                    self.push_error_output_captured(
+                        frames,
                         "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
                     );
                 }
             }
             style => {
                 let text = self.render_backtrace(frames, style, origin);
-                self.push_error_output(&text);
+                self.push_error_output_captured(frames, &text);
             }
         }
     }
@@ -858,7 +859,7 @@ thread '{name}' ({tid}) panicked:
         no_backtrace: bool,
     ) {
         let head = self.panic_report_head_text(self.panic_location_in(frames), message);
-        self.push_error_output(&head);
+        self.push_error_output_captured(frames, &head);
         self.print_report_backtrace_part(frames, in_flight, origin, no_backtrace);
     }
 
