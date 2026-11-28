@@ -62,7 +62,13 @@ impl<'a> Interpreter<'a> {
             Ty::Float(t) => ByteLayout::Scalar(ByteScalar::Float(*t)),
             Ty::Array(elem, n) => {
                 let elem_layout = self.byte_layout_of_ty(elem)?;
-                let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                // The element size prices through the full
+                // walk: an element type may name an ADT by
+                // its bare definition name (the IR types
+                // erase generic arguments), whose size only
+                // the instance-resolving walk prices (see
+                // `ty_size_full`).
+                let elem_size = usize::try_from(self.ty_size_full(elem)?).ok()?;
                 ByteLayout::Seq(
                     Box::new(elem_layout),
                     elem_size,
@@ -543,8 +549,12 @@ impl<'a> Interpreter<'a> {
                     }
                     match &ty {
                         Some(Ty::Array(elem, _)) => {
+                            // The element size prices through
+                            // the full walk, as in
+                            // `byte_layout_of_ty`: the element
+                            // type may be a bare ADT name.
                             let elem_size =
-                                usize::try_from(self.ty_size(elem)?).ok()?;
+                                usize::try_from(self.ty_size_full(elem)?).ok()?;
                             off = off.checked_add(k.checked_mul(elem_size)?)?;
                             size = Some(elem_size);
                             ty = Some((**elem).clone());
@@ -590,7 +600,9 @@ impl<'a> Interpreter<'a> {
                 }
                 RefProj::Subslice { offset, len } => match &ty {
                     Some(Ty::Array(elem, _)) => {
-                        let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                        // Element size through the full walk,
+                        // as in the Index arm above.
+                        let elem_size = usize::try_from(self.ty_size_full(elem)?).ok()?;
                         off = off.checked_add(offset.checked_mul(elem_size)?)?;
                         size = Some(usize::try_from(*len).ok()?.checked_mul(elem_size)?);
                         ty = Some(Ty::Array(elem.clone(), u64::try_from(*len).ok()?));
