@@ -245,3 +245,93 @@ fn run_mode_alloc_error_hook_default_hook_reports_and_aborts() {
         "the default hook reports the failed size: {stderr}"
     );
 }
+
+// ----- oversized repeated fills (`vec![elem; n]`) -----
+//
+// A `vec![elem; n]` whose count passes the materialisation
+// bound of the model is not an unsupported error: the request
+// runs the same graceful failure the native allocation path
+// reports. A byte size past `isize::MAX` is RawVec's
+// capacity-overflow panic; a smaller request runs the
+// allocation-error dispatch, so an installed alloc error hook
+// observes it (and may panic catchably) and the no-hook path
+// prints the default report and aborts. The huge vector is
+// never materialised in any of these tests.
+
+const HOOK_UNWIND_SRC: &str = r#"
+#![feature(alloc_error_hook)]
+use std::hint::black_box;
+use std::mem::forget;
+use std::panic::catch_unwind;
+fn main() {
+    std::alloc::set_alloc_error_hook(|_| panic!());
+    let panic = catch_unwind(|| {
+        let alloc_size = 0x1000_0000_1000_0000u64 as usize;
+        forget(black_box(vec![0u8; alloc_size]));
+    });
+    println!("caught: {}", panic.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_huge_from_elem_reaches_alloc_error_hook() {
+    run_ok(
+        "huge-from-elem-hook",
+        HOOK_UNWIND_SRC,
+        "caught: true\n",
+    );
+}
+
+const HUGE_NO_HOOK_SRC: &str = r#"
+fn main() {
+    let alloc_size = 0x1000_0000_1000_0000u64 as usize;
+    let _v = vec![0u8; alloc_size];
+    println!("never");
+}
+"#;
+
+#[test]
+fn run_mode_huge_from_elem_without_hook_reports_and_aborts() {
+    let dir = temp_dir("huge-from-elem-no-hook");
+    let src = fixture(&dir, "case.rs", HUGE_NO_HOOK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "a huge from_elem with no hook aborts the guest; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("memory allocation of 1152921504875282432 bytes failed"),
+        "the default hook reports the requested size: {stderr}"
+    );
+}
+
+const HUGE_OVERFLOW_SRC: &str = r#"
+fn main() {
+    let n = (isize::MAX as usize / 8) + 1;
+    let _v = vec![0u64; n];
+    println!("never");
+}
+"#;
+
+#[test]
+fn run_mode_huge_from_elem_past_isize_max_is_capacity_overflow() {
+    let dir = temp_dir("huge-from-elem-overflow");
+    let src = fixture(&dir, "case.rs", HUGE_OVERFLOW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "capacity overflow is a guest panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("capacity overflow"),
+        "the panic payload is the capacity-overflow message: {stderr}"
+    );
+    assert!(
+        stderr.contains("library/alloc/src/raw_vec/mod.rs"),
+        "the reported location is the panic site inside RawVec: {stderr}"
+    );
+}

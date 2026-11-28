@@ -8248,13 +8248,28 @@ impl<'a> Interpreter<'a> {
                 };
                 // Mirrors the repeat-aggregate resource bound in
                 // mir_convert: past it the vector is not
-                // materialised, so a huge count fails explicitly
-                // instead of exhausting the host.
+                // materialised. The failure is the native one
+                // for the same request, not an unsupported error:
+                // a byte size past `isize::MAX` is RawVec's
+                // capacity-overflow panic, and any other request
+                // this large runs the allocation-error dispatch
+                // (an installed alloc error hook observes it and
+                // may panic catchably; otherwise the default
+                // report and abort), exactly as a native
+                // allocation of that size failing does. The huge
+                // vector itself is never materialised.
                 const MAX_FROM_ELEM: u128 = 1_000_000;
                 if count > MAX_FROM_ELEM {
-                    return Err(unsupported(format!(
-                        "std::vec::from_elem with {count} elements exceeds the model's {MAX_FROM_ELEM}-element bound"
-                    )));
+                    let elem_tag =
+                        generic_args.first().map(String::as_str).unwrap_or("");
+                    let (elem_size, elem_align) =
+                        self.layout_of(elem_tag).unwrap_or((1, 1));
+                    let elem_size = if elem_size == 0 { 1 } else { elem_size };
+                    return self.exec_oversized_fill_failure(
+                        frames,
+                        count * elem_size,
+                        elem_align,
+                    );
                 }
                 Ok(Value::Enum {
                     variant: 0,
