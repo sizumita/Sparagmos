@@ -1068,14 +1068,73 @@ fn run_mode_slice_iter_write_through_cell() {
     // vector buffer, a spare-capacity (sparse) vector and the
     // `IntoIterator` for `&Vec` form alike. It used to stop
     // with "expected mutable place, found constant aggregate"
-    // because the state held an element snapshot. (A vector
-    // stored as a field sequence -- the `vec!` literal form --
-    // keeps the snapshot: its element positions are field
-    // steps, which the pointer machinery denominates
-    // ambiguously.)
+    // because the state held an element snapshot. (The `vec!`
+    // literal form is covered by
+    // `run_mode_slice_iter_write_through_cell_vec_literal`
+    // below.)
     run_ok(
         "slice-iter-cell-write",
         SLICE_ITER_CELL_WRITE_SRC,
         "arr 7 7 vec 11 21 sparse 6 7 ref 9 9\n",
+    );
+}
+
+const SLICE_ITER_CELL_WRITE_VEC_LITERAL_SRC: &str = r#"
+use std::cell::Cell;
+use std::cell::RefCell;
+
+struct Named {
+    name: &'static str,
+    contents: Cell<Option<usize>>,
+}
+
+fn named(name: &'static str) -> Named {
+    Named { name, contents: Cell::new(None) }
+}
+
+fn main() {
+    let v: Vec<Named> = vec![named("a"), named("b")];
+    for x in v.iter() {
+        x.contents.set(Some(7));
+    }
+    println!("iter {} {}", v[0].contents.get().unwrap(), v[1].contents.get().unwrap());
+    for x in &v {
+        x.contents.set(Some(9));
+    }
+    println!("ref {} {}", v[0].contents.get().unwrap(), v[1].contents.get().unwrap());
+    let w: Vec<Named> = vec![named("x"), named("y"), named("z")];
+    for x in w.iter().rev() {
+        x.contents.set(Some(3));
+    }
+    let it = w.iter();
+    let s = it.as_slice();
+    println!("slice {} {} {}", s.len(), s[0].contents.get().unwrap(), s[2].name);
+    let r: Vec<RefCell<Vec<i32>>> = vec![RefCell::new(vec![1]), RefCell::new(vec![2])];
+    for x in &r {
+        x.borrow_mut().push(9);
+    }
+    println!("refcell {} {}", r[0].borrow().len(), r[1].borrow()[1]);
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_write_through_cell_vec_literal() {
+    // The `vec!` literal form: the conversion leaves the
+    // vector's elements in the ADT aggregate that holds the
+    // `Vec` value (its fields are its elements), so the
+    // element positions `iter_mut_element_ref` builds over it
+    // are field steps. `slice_iter_storage_state` re-spells
+    // them as the index steps that denote the same elements
+    // of the aggregate, so a write through a borrowed
+    // iterator over a `vec!` vector -- `iter()`, the `&Vec`
+    // form, `rev()`, a `RefCell` element -- lands in the
+    // vector's own storage, and `as_slice` reads the written
+    // values back. It used to keep the element snapshot for
+    // this form and stop with "expected mutable place, found
+    // constant aggregate" at the first write.
+    run_ok(
+        "slice-iter-cell-write-vec-literal",
+        SLICE_ITER_CELL_WRITE_VEC_LITERAL_SRC,
+        "iter 7 7\nref 9 9\nslice 3 3 z\nrefcell 2 9\n",
     );
 }
