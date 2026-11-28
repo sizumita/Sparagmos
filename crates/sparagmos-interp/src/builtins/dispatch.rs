@@ -4327,6 +4327,52 @@ impl<'a> Interpreter<'a> {
                     bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
                 Ok(os_string_value(&lowered))
             }
+            Builtin::OsStrMakeAsciiCase(upper) => {
+                arity(1)?;
+                // `OsStr::make_ascii_lowercase/uppercase(&mut
+                // self)`: the receiver is the `&mut OsStr` the
+                // `DerefMut` model hands out -- the `OsString`
+                // place itself -- so the case folding rewrites
+                // the string the place holds, as
+                // `str::make_ascii_*` rewrites a `String` place
+                // through `modify_string`. The rewritten value
+                // takes the element form; every reader of an
+                // `OsString` place accepts either shape (see
+                // `os_string_bytes_any`).
+                let target = self.deref_value(frames, &vals[0])?;
+                let stored = self.read_resolved(frames, &target)?;
+                // A boxed `OsStr`'s place holds the byte
+                // string itself (the `Bytes` denomination a
+                // `Box<OsStr>` allocation stores); its fold
+                // rewrites it in that same denomination,
+                // where an `OsString` place's fold rewrites
+                // the string value.
+                let boxed_bytes = matches!(stored, Value::Bytes(_));
+                let mut bytes = match &stored {
+                    Value::Bytes(raw) => raw.clone(),
+                    _ => self
+                        .os_string_bytes_any(frames, &stored)?
+                        .ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "OsStr::make_ascii_uppercase/lowercase",
+                                "an OS string value",
+                                stored.kind_name(),
+                            )
+                        })?,
+                };
+                if upper {
+                    bytes.make_ascii_uppercase();
+                } else {
+                    bytes.make_ascii_lowercase();
+                }
+                let rewritten = if boxed_bytes {
+                    Value::Bytes(bytes)
+                } else {
+                    os_string_value(&bytes)
+                };
+                self.write_resolved(frames, &target, rewritten)?;
+                Ok(Value::Unit)
+            }
             Builtin::DirEntryPath | Builtin::DirEntryFileName => {
                 arity(1)?;
                 let entry = self.resolve_value(frames, &vals[0])?;
@@ -9224,6 +9270,14 @@ impl<'a> Interpreter<'a> {
                     // `CString::deref_mut -> &mut CStr`: the
                     // same fat reference `deref` produces.
                     self.c_string_deref(frames, &vals[0])
+                } else if self_ty == "std::ffi::OsString" {
+                    // `&mut OsStr` over the `OsString` place
+                    // itself, as the `String` arm above hands
+                    // out `&mut str` over the `String` place:
+                    // reads see the string's bytes, and the
+                    // `OsStr` mutation builtins rewrite the
+                    // string the place holds.
+                    Ok(vals.into_iter().next().expect("arity checked"))
                 } else if self_ty.starts_with("std::boxed::Box<")
                     || self_ty.starts_with("alloc::boxed::Box<")
                 {

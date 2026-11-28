@@ -3769,7 +3769,20 @@ impl<'a> Interpreter<'a> {
                             .or_else(|| {
                                 self.read_resolved_peek(frames, &target)
                                     .ok()
-                                    .and_then(|v| v.len())
+                                    .and_then(|v| {
+                                        // A vector in its real
+                                        // aggregate form reports
+                                        // its field count (2) as
+                                        // its `len()`; the slice
+                                        // over its storage is the
+                                        // live length the aggregate
+                                        // carries beside the buffer
+                                        // (see
+                                        // `vec_real_aggregate_parts`).
+                                        crate::builtins::vec_real_aggregate_parts(&v)
+                                            .map(|(_, len)| len as u128)
+                                        .or_else(|| v.len())
+                                    })
                             })
                             .or_else(|| self.fat_tail_field_len(frames, body, place))
                     }

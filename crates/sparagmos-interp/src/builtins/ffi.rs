@@ -581,6 +581,12 @@ pub(crate) fn ffi_lookup(canonical: &str) -> Option<Builtin> {
         "std::ffi::CString::into_string" => Builtin::CStringIntoString,
         "std::ffi::CString::into_boxed_c_str" => Builtin::CStringIntoBoxedCStr,
         "std::ffi::OsStr::to_ascii_lowercase" => Builtin::OsStrToAsciiLowercase,
+        "std::ffi::OsStr::make_ascii_lowercase" => {
+            Builtin::OsStrMakeAsciiCase(false)
+        }
+        "std::ffi::OsStr::make_ascii_uppercase" => {
+            Builtin::OsStrMakeAsciiCase(true)
+        }
         "std::ffi::OsString::to_string_lossy" => Builtin::ToStringLossy,
         "std::ffi::OsString::into_boxed_os_str" => Builtin::OsStringIntoBoxedOsStr,
         "std::ffi::OsStr::to_string_lossy" => Builtin::ToStringLossy,
