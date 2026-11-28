@@ -11599,17 +11599,13 @@ impl<'a> Interpreter<'a> {
                     _ => container.clone(),
                 }
             } else {
-                self.iter_mut_element_ref(frames, container, 0)?
+                self.iter_mut_element_ref(frames, container, 0, Some(len))?
             };
             (first, Value::Ref(RefTarget::Address(len as u64)))
         } else {
             (
-                self.iter_mut_element_ref(frames, container, 0)?,
-                self.iter_mut_element_ref(
-                    frames,
-                    container,
-                    len as usize,
-                )?,
+                self.iter_mut_element_ref(frames, container, 0, Some(len))?,
+                self.iter_mut_element_ref(frames, container, len as usize, Some(len))?,
             )
         };
         Ok(Value::Enum {

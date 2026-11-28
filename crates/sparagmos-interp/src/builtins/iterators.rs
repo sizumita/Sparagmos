@@ -1675,8 +1675,12 @@ impl<'a> Interpreter<'a> {
                 if let (Value::Uint(idx), Value::Uint(len)) = (&fields[1], &fields[2]) {
                     let (idx, len) = (*idx, *len);
                     if idx < len {
-                        let elem =
-                            self.iter_mut_element_ref(frames, &fields[0], (len - 1) as usize)?;
+                        let elem = self.iter_mut_element_ref(
+                            frames,
+                            &fields[0],
+                            (len - 1) as usize,
+                            Some(len),
+                        )?;
                         return Ok((
                             rebuild_state(
                                 &state,
@@ -3500,11 +3504,28 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The reference to element `idx` of the container a
+    /// value denotes, in the container's own storage.
+    /// `spanned` is the length of the sequence the container
+    /// spans, when the caller knows it (a fat reference's
+    /// length, an `IterMut` state's length field, the length
+    /// an `iter_mut` state is built over, a snapshot's
+    /// length). The length denominates an element-entry
+    /// suffix on the container's position (see
+    /// `entry_suffix_denotes_elements`): a position that is
+    /// itself a sequence of exactly the spanned length is
+    /// that sequence behind a genuine field step -- an outer
+    /// element's field, a nested sequence's own storage --
+    /// and its elements are addressed by appending the
+    /// element step, not by advancing the suffix's index
+    /// step. Without a known length the two readings cannot
+    /// be told apart and the advance stands.
     pub(super) fn iter_mut_element_ref(
         &self,
         frames: &[Frame],
         container: &Value,
         idx: usize,
+        spanned: Option<u128>,
     ) -> InterpResult<Value> {
         match container {
             Value::Ref(RefTarget::Place {
@@ -3524,8 +3545,15 @@ impl<'a> Interpreter<'a> {
                 // entered position advanced by the index. (A
                 // sequence at the entered position is a slice
                 // over an element's own array field — the plain
-                // reading below; without the fat length the two
-                // shapes cannot be told apart here.)
+                // reading below. When the spanned length is
+                // known it denominates the two readings (see
+                // `entry_suffix_denotes_elements`): a position
+                // that is itself a sequence of exactly the
+                // spanned length is that sequence behind a
+                // genuine field step, and the plain reading
+                // below addresses its elements. Without the
+                // length the two shapes cannot be told apart
+                // here and the advance stands.)
                 if !matches!(
                     base,
                     Value::Tuple(_)
@@ -3534,11 +3562,17 @@ impl<'a> Interpreter<'a> {
                         | Value::Str(_)
                 ) {
                     if let Some(projection) = advance_entry_projection(projection, idx) {
-                        return Ok(Value::Ref(RefTarget::Place {
-                            frame: *frame,
-                            local: *local,
-                            projection,
-                        }));
+                        let entered = match spanned {
+                            Some(len) => self.entry_suffix_denotes_elements(frames, &target, len),
+                            None => true,
+                        };
+                        if entered {
+                            return Ok(Value::Ref(RefTarget::Place {
+                                frame: *frame,
+                                local: *local,
+                                projection,
+                            }));
+                        }
                     }
                 }
                 let mut projection = projection.clone();
@@ -3546,7 +3580,7 @@ impl<'a> Interpreter<'a> {
                     Value::Tuple(_) | Value::SparseVec { .. } => {
                         projection.push(RefProj::Index(idx))
                     }
-                    Value::Enum { .. } => projection.push(RefProj::Field(idx)),
+                    Value::Enum { .. } => push_aggregate_element_step(&mut projection, idx),
                     ref other => {
                         return Err(unsupported(format!(
                             "Iterator::next for slice::IterMut over a {} is not runtime-supported",
@@ -3577,10 +3611,16 @@ impl<'a> Interpreter<'a> {
                         | Value::Str(_)
                 ) {
                     if let Some(projection) = advance_entry_projection(projection, idx) {
-                        return Ok(Value::Ref(RefTarget::Static {
-                            name: name.clone(),
-                            projection,
-                        }));
+                        let entered = match spanned {
+                            Some(len) => self.entry_suffix_denotes_elements(frames, &target, len),
+                            None => true,
+                        };
+                        if entered {
+                            return Ok(Value::Ref(RefTarget::Static {
+                                name: name.clone(),
+                                projection,
+                            }));
+                        }
                     }
                 }
                 let mut projection = projection.clone();
@@ -3588,7 +3628,7 @@ impl<'a> Interpreter<'a> {
                     Value::Tuple(_) | Value::SparseVec { .. } => {
                         projection.push(RefProj::Index(idx))
                     }
-                    Value::Enum { .. } => projection.push(RefProj::Field(idx)),
+                    Value::Enum { .. } => push_aggregate_element_step(&mut projection, idx),
                     ref other => {
                         return Err(unsupported(format!(
                             "Iterator::next for slice::IterMut over a {} is not runtime-supported",
@@ -3620,10 +3660,16 @@ impl<'a> Interpreter<'a> {
                     if let Some(projection) =
                         advance_entry_projection(projection, idx)
                     {
-                        return Ok(Value::Ref(RefTarget::Alloc {
-                            id: *id,
-                            projection,
-                        }));
+                        let entered = match spanned {
+                            Some(len) => self.entry_suffix_denotes_elements(frames, &target, len),
+                            None => true,
+                        };
+                        if entered {
+                            return Ok(Value::Ref(RefTarget::Alloc {
+                                id: *id,
+                                projection,
+                            }));
+                        }
                     }
                 }
                 let mut projection = projection.clone();
@@ -3631,9 +3677,7 @@ impl<'a> Interpreter<'a> {
                     Value::Tuple(_) | Value::SparseVec { .. } => {
                         projection.push(RefProj::Index(idx))
                     }
-                    Value::Enum { .. } => {
-                        projection.push(RefProj::Field(idx))
-                    }
+                    Value::Enum { .. } => push_aggregate_element_step(&mut projection, idx),
                     ref other => {
                         return Err(unsupported(format!(
                             "Iterator::next for slice::IterMut over a {} is not runtime-supported",
@@ -3646,7 +3690,9 @@ impl<'a> Interpreter<'a> {
                     projection,
                 }))
             }
-            Value::FatRef { base, .. } => self.iter_mut_element_ref(frames, base, idx),
+            Value::FatRef { base, len } => {
+                self.iter_mut_element_ref(frames, base, idx, Some(*len))
+            }
             other => Err(unsupported(format!(
                 "Iterator::next for slice::IterMut over {} is not runtime-supported",
                 other.kind_name()
@@ -3672,10 +3718,22 @@ impl<'a> Interpreter<'a> {
         arg: &Value,
         elems: &[Value],
     ) -> Option<Value> {
-        let first =
-            respell_field_element_step(&self.iter_mut_element_ref(frames, arg, 0).ok()?);
+        // The snapshot's length is the length of the
+        // sequence the argument denotes: it denominates an
+        // element-entry suffix on the argument's position
+        // (see `iter_mut_element_ref`), which the
+        // argument's own form does not always carry (a thin
+        // reference to the container, above all).
+        let spanned = Some(elems.len() as u128);
+        let first = respell_field_element_step(
+            &self
+                .iter_mut_element_ref(frames, arg, 0, spanned)
+                .ok()?,
+        );
         let end = respell_field_element_step(
-            &self.iter_mut_element_ref(frames, arg, elems.len()).ok()?,
+            &self
+                .iter_mut_element_ref(frames, arg, elems.len(), spanned)
+                .ok()?,
         );
         // The step machinery locates a pointer's element step
         // with `elem_step_pos`, which reads a trailing entry
@@ -3745,7 +3803,7 @@ impl<'a> Interpreter<'a> {
             }
             let last = respell_field_element_step(
                 &self
-                    .iter_mut_element_ref(frames, arg, elems.len() - 1)
+                    .iter_mut_element_ref(frames, arg, elems.len() - 1, spanned)
                     .ok()?,
             );
             if read_back(elems.len() - 1, &last) != Some(true) {
@@ -4400,8 +4458,12 @@ impl<'a> Interpreter<'a> {
             if let (Value::Uint(idx), Value::Uint(len)) = (&fields[1], &fields[2]) {
                 let (idx, len) = (*idx, *len);
                 if idx < len {
-                    let elem =
-                        self.iter_mut_element_ref(frames, &fields[0], idx as usize)?;
+                    let elem = self.iter_mut_element_ref(
+                        frames,
+                        &fields[0],
+                        idx as usize,
+                        Some(len),
+                    )?;
                     (
                         vec![
                             fields[0].clone(),
@@ -8632,6 +8694,26 @@ fn iter_ptr_with_index(value: &Value, idx: usize) -> Option<Value> {
             with_index(projection, idx)?,
         ))),
         _ => None,
+    }
+}
+
+/// Append the element step for element `idx` of an element
+/// aggregate (an ADT value whose fields are its elements) to
+/// a projection. The step is appended as a field step, the
+/// aggregate's own spelling; when an outer sequence's index
+/// step precedes it in the projection, the step machinery
+/// would locate the element step at that outer step instead
+/// (see `elem_step_pos`), so the appended step is spelled as
+/// an index step: over an element aggregate the two spellings
+/// denote the same element (see
+/// `respell_field_element_step`), and the index spelling is
+/// the one the machinery reads back as the element step of
+/// the position the builder denotes.
+fn push_aggregate_element_step(projection: &mut Vec<RefProj>, idx: usize) {
+    projection.push(RefProj::Field(idx));
+    if elem_step_pos(projection) != Some(projection.len() - 1) {
+        let last = projection.len() - 1;
+        projection[last] = RefProj::Index(idx);
     }
 }
 

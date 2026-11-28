@@ -2430,6 +2430,41 @@ impl<'a> Interpreter<'a> {
         // two-element slice (the array clone guard's partial drop)
         // for the slice's storage.
         if let Some((container, base)) = entered_element_container(cur) {
+            // A position whose value is the slice's own
+            // storage aggregate -- a vector's element
+            // aggregate or sparse form holding exactly the
+            // fat length's elements, and not an ADT element
+            // of the slice (the judgment the count reading
+            // below makes) -- denotes that storage, not an
+            // entered element: the field steps after the
+            // index step selected the storage inside the
+            // element (a struct field's vector is the
+            // canonical case), they did not enter the
+            // element. The denomination is the one
+            // `entry_suffix_denotes_elements` makes for the
+            // same shape: a target that is itself a sequence
+            // of exactly the fat length is the sequence.
+            if let Ok(value) = self.read_resolved_peek(frames, cur) {
+                let projection: &[RefProj] = match cur {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. }
+                    | Resolved::Value(_, projection) => projection,
+                };
+                let adt_element = matches!(&*value, Value::Enum { .. })
+                    && crate::builtins::vec_real_aggregate_parts(&value).is_none()
+                    && projection_ends_at_element(projection)
+                    && elem_ty.is_some_and(|ty| {
+                        matches!(ty, Ty::Adt(_))
+                            && value_matches_adt_shape(self.program(), &value, ty, 0)
+                    });
+                if !adt_element
+                    && matches!(&*value, Value::Enum { .. } | Value::SparseVec { .. })
+                    && value.len() == Some(fat_len)
+                {
+                    return true;
+                }
+            }
             if let Ok(value) = self.read_resolved_peek(frames, &container) {
                 if let Some(count) = value.len() {
                     if base as u128 + fat_len <= count {
