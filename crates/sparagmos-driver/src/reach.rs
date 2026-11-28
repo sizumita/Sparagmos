@@ -632,6 +632,7 @@ pub fn collect_reachable(
             if sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
                 && !consumer_instance_needs_body(&def, &canonical, &args)
                 && !partial_eq_ref_instance_needs_body(&canonical, &args)
+                && !partial_eq_adt_instance_needs_body(&canonical, &args)
                 && !value_demand_needs_body(&canonical, &args, demand)
             {
                 if builtin_seen.insert(def_id) {
@@ -1979,6 +1980,46 @@ fn consumer_instance_tra_specialized(
         }
     }
     false
+}
+
+/// Whether a call target naming `PartialEq::eq` / `ne` whose
+/// `Self` type is an ADT defined outside std / core / alloc must
+/// still have its instance body collected: that instance is the
+/// impl the ADT's own crate wrote for it, hand-written or
+/// derived. The builtin's structural comparison is a model of
+/// derived equality only, so it silently replaces the semantics
+/// of a hand-written impl whose result differs from a field-wise
+/// comparison (an equality that relates values across enum
+/// variants is the shape that exposed this: the `similar`
+/// crate's token-interning key compares equal across its `Old`
+/// and `New` variants, and the structural model calls every
+/// cross-variant pair unequal, so no token ever interned across
+/// the two sides of a diff). The modelled std types keep the
+/// builtin, whose special cases (paths, strings, collections)
+/// are written against them; an impl body that does not convert
+/// cleanly costs nothing, because call resolution only binds a
+/// clean target and otherwise keeps the builtin (see
+/// `resolve_impl_callee` in the interpreter's converter).
+fn partial_eq_adt_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
+    if !matches!(
+        canonical,
+        "std::cmp::PartialEq::eq"
+            | "core::cmp::PartialEq::eq"
+            | "std::cmp::PartialEq::ne"
+            | "core::cmp::PartialEq::ne"
+    ) {
+        return false;
+    }
+    let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+        return false;
+    };
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    !(name.starts_with("std::")
+        || name.starts_with("core::")
+        || name.starts_with("alloc::"))
 }
 
 /// Whether a call target naming `PartialEq::eq` / `ne` whose

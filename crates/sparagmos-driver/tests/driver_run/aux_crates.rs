@@ -1213,3 +1213,171 @@ fn run_mode_clean_conversion_stays_clear_of_the_trimmed_paths_check() {
         "the trimmed-paths teardown check must not fire: {stderr}"
     );
 }
+
+
+const AUX_XKEY_SRC: &str = r#"
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::hash::{Hash, Hasher};
+
+#[derive(Debug)]
+enum Key<'o, 'n, Old: ?Sized, New: ?Sized> {
+    Old(&'o Old),
+    New(&'n New),
+}
+
+impl<Old: ?Sized, New: ?Sized> Clone for Key<'_, '_, Old, New> {
+    fn clone(&self) -> Self { *self }
+}
+impl<Old: ?Sized, New: ?Sized> Copy for Key<'_, '_, Old, New> {}
+
+impl<Old: Hash + ?Sized, New: Hash + ?Sized> Hash for Key<'_, '_, Old, New> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Key::Old(x) => x.hash(state),
+            Key::New(x) => x.hash(state),
+        }
+    }
+}
+
+impl<Old: ?Sized, New: ?Sized> PartialEq for Key<'_, '_, Old, New>
+where
+    Old: Eq,
+    New: Eq + PartialEq<Old>,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Key::Old(a), Key::Old(b)) => a == b,
+            (Key::New(a), Key::New(b)) => a == b,
+            (Key::Old(a), Key::New(b)) | (Key::New(b), Key::Old(a)) => b == a,
+        }
+    }
+}
+impl<Old: ?Sized, New: ?Sized> Eq for Key<'_, '_, Old, New>
+where
+    Old: Eq,
+    New: Eq + PartialEq<Old>,
+{
+}
+
+pub fn variant_eqs(a: &str, b: &str) -> (bool, bool, bool, bool) {
+    let oa = Key::Old(a);
+    let ob = Key::Old(b);
+    let na = Key::New(a);
+    let nb = Key::New(b);
+    (oa == ob, na == nb, oa == na, na == oa)
+}
+
+pub fn variant_ne(a: &str, b: &str) -> bool {
+    Key::Old(a) != Key::New(b)
+}
+
+pub fn intern(old: &[&str], new: &[&str]) -> (Vec<u32>, Vec<u32>) {
+    let mut map: HashMap<Key<'_, '_, str, str>, u32> = HashMap::new();
+    let mut next = 0u32;
+    let mut old_ids = Vec::new();
+    for t in old {
+        let id = match map.entry(Key::Old(*t)) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => { let id = next; next += 1; e.insert(id); id }
+        };
+        old_ids.push(id);
+    }
+    let mut new_ids = Vec::new();
+    for t in new {
+        let id = match map.entry(Key::New(*t)) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => { let id = next; next += 1; e.insert(id); id }
+        };
+        new_ids.push(id);
+    }
+    (old_ids, new_ids)
+}
+"#;
+
+const AUX_XKEY_EQ_MAIN_SRC: &str = r#"
+extern crate xkey;
+fn main() {
+    let (oo, nn, on, no) = xkey::variant_eqs("a\n", "a\n");
+    println!("same: oo={} nn={} on={} no={}", oo, nn, on, no);
+    let (oo, nn, on, no) = xkey::variant_eqs("a\n", "b\n");
+    println!("diff: oo={} nn={} on={} no={}", oo, nn, on, no);
+    println!("ne same: {}", xkey::variant_ne("a\n", "a\n"));
+    println!("ne diff: {}", xkey::variant_ne("a\n", "b\n"));
+}
+"#;
+
+const AUX_XKEY_INTERN_MAIN_SRC: &str = r#"
+extern crate xkey;
+fn digits(ids: &[u32]) -> String {
+    let mut s = String::new();
+    for id in ids {
+        s.push(char::from_digit(*id, 10).unwrap());
+        s.push(',');
+    }
+    s
+}
+fn main() {
+    let toks = ["a\n", "b\n", "a\n", "c\n"];
+    let (o, n) = xkey::intern(&toks, &toks);
+    println!("intern old: {}", digits(&o));
+    println!("intern new: {}", digits(&n));
+}
+"#;
+
+#[test]
+fn run_mode_aux_handwritten_partial_eq_cross_variant() {
+    // A hand-written `PartialEq` for an auxiliary crate's generic
+    // enum whose equality relates values across variants (the
+    // token-interning key shape of the `similar` crate, Refs
+    // #360): the reach walk used to leave every such call to the
+    // interpreter's structural-equality builtin, which models
+    // derived equality only, so cross-variant pairs always
+    // compared unequal and no token ever interned across the two
+    // sides of a text diff. The instance body must be collected
+    // and executed instead.
+    let dir = temp_dir("aux-xkey-eq");
+    let aux = fixture(&dir, "xkey.rs", AUX_XKEY_SRC);
+    let src = fixture(&dir, "xkey_eq_main.rs", AUX_XKEY_EQ_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("xkey", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the cross-variant eq guest must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "same: oo=true nn=true on=true no=true\n\
+         diff: oo=false nn=false on=true no=true\n\
+         ne same: false\n\
+         ne diff: true\n",
+        "the aux crate's hand-written eq semantics must be observed"
+    );
+}
+
+#[test]
+fn run_mode_aux_interning_key_ids_match_across_sides() {
+    // The interning consumer of the same key type: tokens from
+    // the second side must reuse the ids assigned on the first
+    // side, which needs the cross-variant `eq` above plus the
+    // matching hash. With the structural builtin serving the eq
+    // calls, the second side's ids continued the counter instead
+    // ([3, 4, 3, 5] below), and a diff over the two id sequences
+    // degenerated into a full replacement.
+    let dir = temp_dir("aux-xkey-intern");
+    let aux = fixture(&dir, "xkey.rs", AUX_XKEY_SRC);
+    let src = fixture(&dir, "xkey_intern_main.rs", AUX_XKEY_INTERN_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("xkey", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the interning guest must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "intern old: 0,1,0,2,\nintern new: 0,1,0,2,\n",
+        "ids must match across the two sides"
+    );
+}
