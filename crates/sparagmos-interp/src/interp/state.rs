@@ -483,7 +483,22 @@ pub(crate) fn rc_handle_id(value: &Value) -> Option<u64> {
         _ => return None,
     };
     match &inner[0] {
-        Value::Ref(RefTarget::Alloc { id, projection }) if projection.is_empty() => Some(*id),
+        // The pointer denotes the allocation's base: no steps,
+        // or only zero steps (a first-element / first-field /
+        // zero-offset step), the forms a raw allocation block's
+        // pointer carries -- the block's first element, and
+        // the wrapper aggregate's first field around the inner
+        // a guest construction nested there (the shape a
+        // handle built through the raw allocation path, e.g.
+        // `UniqueArc::into_arc`, has).
+        Value::Ref(RefTarget::Alloc { id, projection })
+            if projection.iter().all(|s| matches!(
+                s,
+                RefProj::Index(0) | RefProj::Field(0) | RefProj::ByteOffset(0)
+            )) =>
+        {
+            Some(*id)
+        }
         _ => None,
     }
 }
@@ -509,7 +524,15 @@ pub(crate) fn raw_waker_alloc_id(value: &Value) -> Option<u64> {
     }
     match data {
         Value::Ref(RefTarget::Alloc { id, projection })
-            if projection.as_slice() == [RefProj::Field(2)] =>
+            if projection.last() == Some(&RefProj::Field(2))
+                && projection[..projection.len() - 1]
+                    .iter()
+                    .all(|s| matches!(
+                        s,
+                        RefProj::Index(0)
+                            | RefProj::Field(0)
+                            | RefProj::ByteOffset(0)
+                    )) =>
         {
             Some(*id)
         }
@@ -1360,24 +1383,37 @@ impl<'a> Interpreter<'a> {
     /// so shape alone cannot license count discipline -- the
     /// store's contents are the deciding evidence.
     pub(crate) fn rc_inner_id(&self, value: &Value) -> Option<u64> {
+        self.rc_inner_loc(value).map(|(id, _)| id)
+    }
+
+    /// The reference-counted allocation a value denotes and
+    /// the projection from the allocation's base to its
+    /// `RcInner` / `ArcInner` aggregate, when the value has a
+    /// handle's shape AND the allocation it names really holds
+    /// such an aggregate (see `rc_inner_id`). The projection
+    /// is empty for a modelled handle; a handle built through
+    /// the raw allocation path holds its inner behind the
+    /// block's slot / wrapper steps (see `rc_inner_prefix`).
+    pub(crate) fn rc_inner_loc(&self, value: &Value) -> Option<(u64, Vec<RefProj>)> {
         let id = rc_handle_id(value)?;
         let store = self.allocs.borrow();
         let inner = store.get(&id)?;
-        fn count_cell(v: &Value) -> bool {
-            fn unwrap1(v: &Value) -> Option<&Value> {
-                match v {
-                    Value::Enum { fields, .. } if fields.len() == 1 => fields.first(),
-                    _ => None,
-                }
-            }
-            matches!(unwrap1(v).and_then(unwrap1), Some(Value::Uint(_)))
+        rc_inner_prefix(inner).map(|prefix| (id, prefix))
+    }
+
+    /// The projection naming the pointee (the inner
+    /// aggregate's value field) of the reference-counted
+    /// handle `value`, when it denotes one: the inner's own
+    /// prefix followed by the value-field step. Falls back to
+    /// the plain value-field step for a handle-shaped value
+    /// whose allocation contents do not license the inner
+    /// reading, exactly as the shape-only readers did.
+    pub(crate) fn rc_pointee_projection(&self, value: &Value) -> Option<Vec<RefProj>> {
+        if let Some((_, mut prefix)) = self.rc_inner_loc(value) {
+            prefix.push(RefProj::Field(2));
+            return Some(prefix);
         }
-        match inner {
-            Value::Enum { fields, .. } if fields.len() >= 3 => {
-                (count_cell(&fields[0]) && count_cell(&fields[1])).then_some(id)
-            }
-            _ => None,
-        }
+        rc_handle_id(value).map(|_| vec![RefProj::Field(2)])
     }
 
     pub(crate) fn rc_dec_strong(&self, id: u64) -> InterpResult<bool> {

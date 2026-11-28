@@ -1372,11 +1372,11 @@ impl<'a> Interpreter<'a> {
             // it (`rc_inner_id`): the resolved value's shape
             // alone cannot tell a reference-counted handle from
             // a plain aggregate that shares it (a `CString`).
-            let shaped = if let Some(id) = self.rc_inner_id(&resolved) {
-                Value::Ref(RefTarget::Alloc {
-                    id,
-                    projection: vec![RefProj::Field(2)],
-                })
+            let shaped = if let Some((id, mut projection)) =
+                self.rc_inner_loc(&resolved)
+            {
+                projection.push(RefProj::Field(2));
+                Value::Ref(RefTarget::Alloc { id, projection })
             } else if let Value::Enum { fields, .. } = &resolved {
                 if fields.len() == 1
                     && (matches!(base.as_ref(), Value::Enum { .. })
@@ -2365,11 +2365,11 @@ impl<'a> Interpreter<'a> {
                 // an allocation pointer -- and reading such a
                 // value as a handle would name a byte inside its
                 // buffer instead of the value itself.
-                let pointee = if let Some(id) = self.rc_inner_id(&pointee) {
-                    Value::Ref(RefTarget::Alloc {
-                        id,
-                        projection: vec![RefProj::Field(2)],
-                    })
+                let pointee = if let Some((id, mut projection)) =
+                    self.rc_inner_loc(&pointee)
+                {
+                    projection.push(RefProj::Field(2));
+                    Value::Ref(RefTarget::Alloc { id, projection })
                 } else if let Value::Enum { fields, .. } = &pointee {
                     if fields.len() == 1 && matches!(base.as_ref(), Value::Enum { .. }) {
                         // The data pointer is the box aggregate

@@ -1648,7 +1648,9 @@ impl<'a> Interpreter<'a> {
                         frames,
                         &Resolved::Alloc {
                             id,
-                            projection: vec![RefProj::Field(2)],
+                            projection: self
+                                .rc_pointee_projection(&value)
+                                .expect("handle checked"),
                         },
                     )?;
                     self.view_value_as(frames, pointee, &inner_ty, target_ty, what)

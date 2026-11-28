@@ -189,41 +189,152 @@ pub(crate) fn unsized_tail_is_array(pointee: &Value) -> bool {
 /// `ArcInner` aggregate: field `field` (0 = strong, 1 = weak) is
 /// a `Cell<usize>` / `AtomicUsize` wrapper around an
 /// `UnsafeCell<usize>` holding the count.
-pub(crate) fn count_leaf(inner: &Value, field: usize) -> Option<u128> {
-    fn unwrap1(v: &Value) -> Option<&Value> {
-        match v {
-            Value::Enum { fields, .. } if fields.len() == 1 => Some(&fields[0]),
-            _ => None,
+/// Whether `v` has the `RcInner` / `ArcInner` aggregate shape:
+/// at least three fields whose first two are count cells (a
+/// `usize` under any number of one-field wrappers).
+pub(crate) fn rc_inner_shape(v: &Value) -> bool {
+    fn count_cell(v: &Value) -> bool {
+        let mut cur = v;
+        loop {
+            match cur {
+                Value::Uint(_) => return true,
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    cur = &fields[0];
+                }
+                _ => return false,
+            }
         }
     }
+    match v {
+        Value::Enum { fields, .. } if fields.len() >= 3 => {
+            count_cell(&fields[0]) && count_cell(&fields[1])
+        }
+        _ => false,
+    }
+}
+
+/// The projection from an allocation's base value to the
+/// `RcInner` / `ArcInner` aggregate it holds, if one is there:
+/// the aggregate sits at the surface for a modelled handle,
+/// in the first slot of a raw allocation block's tuple, or
+/// behind first-field steps of a wrapper aggregate a guest
+/// construction nested around it (the shape a handle built
+/// through the raw allocation path -- `Box::new_in` inside
+/// `UniqueArc::new_in`, converted by its real body -- has:
+/// the block's first slot is an aggregate whose first field
+/// is the inner). `None` when no inner shape is found.
+pub(crate) fn rc_inner_prefix(value: &Value) -> Option<Vec<RefProj>> {
+    fn go(v: &Value, prefix: &mut Vec<RefProj>, depth: usize) -> bool {
+        if rc_inner_shape(v) {
+            return true;
+        }
+        if depth >= 8 {
+            return false;
+        }
+        match v {
+            Value::Tuple(items) if !items.is_empty() => {
+                prefix.push(RefProj::Index(0));
+                if go(&items[0], prefix, depth + 1) {
+                    true
+                } else {
+                    prefix.pop();
+                    false
+                }
+            }
+            Value::Enum { fields, .. } if !fields.is_empty() => {
+                prefix.push(RefProj::Field(0));
+                if go(&fields[0], prefix, depth + 1) {
+                    true
+                } else {
+                    prefix.pop();
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+    let mut prefix = Vec::new();
+    go(value, &mut prefix, 0).then_some(prefix)
+}
+
+/// The `RcInner` / `ArcInner` aggregate an allocation's base
+/// value holds (see [`rc_inner_prefix`]).
+pub(crate) fn rc_inner_of(value: &Value) -> Option<&Value> {
+    let prefix = rc_inner_prefix(value)?;
+    let mut cur = value;
+    for step in &prefix {
+        cur = match (cur, step) {
+            (Value::Tuple(items), RefProj::Index(i)) => &items[*i as usize],
+            (Value::Enum { fields, .. }, RefProj::Field(i)) => &fields[*i as usize],
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// The mutable `RcInner` / `ArcInner` aggregate an
+/// allocation's base value holds (see [`rc_inner_prefix`]).
+pub(crate) fn rc_inner_of_mut(value: &mut Value) -> Option<&mut Value> {
+    let prefix = rc_inner_prefix(value)?;
+    let mut cur = value;
+    for step in &prefix {
+        cur = match (cur, step) {
+            (Value::Tuple(items), RefProj::Index(i)) => &mut items[*i as usize],
+            (Value::Enum { fields, .. }, RefProj::Field(i)) => {
+                &mut fields[*i as usize]
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+pub(crate) fn count_leaf(inner: &Value, field: usize) -> Option<u128> {
+    // The inner aggregate may sit behind a raw allocation
+    // block's slot / wrapper steps (see `rc_inner_prefix`).
+    let inner = rc_inner_of(inner)?;
     let fields = match inner {
         Value::Enum { fields, .. } => fields,
         _ => return None,
     };
-    let leaf = unwrap1(unwrap1(fields.get(field)?)?)?;
-    match leaf {
-        Value::Uint(n) => Some(*n),
-        _ => None,
+    // The count cell's wrappers: the modelled handles carry
+    // two one-field layers (the atomic / cell struct and its
+    // `UnsafeCell`), a guest-built inner carries as many as
+    // its own aggregate construction nested -- descend through
+    // every one-field wrapper to the count itself.
+    let mut leaf = fields.get(field)?;
+    loop {
+        match leaf {
+            Value::Uint(n) => return Some(*n),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                leaf = &fields[0];
+            }
+            _ => return None,
+        }
     }
 }
 
 /// The mutable count leaf of one reference count (see
 /// [`count_leaf`]).
 pub(crate) fn count_leaf_mut(inner: &mut Value, field: usize) -> Option<&mut u128> {
-    fn unwrap1_mut(v: &mut Value) -> Option<&mut Value> {
-        match v {
-            Value::Enum { fields, .. } if fields.len() == 1 => fields.first_mut(),
-            _ => None,
-        }
-    }
+    // See `count_leaf`: the inner aggregate may sit behind a
+    // raw allocation block's slot / wrapper steps.
+    let inner = rc_inner_of_mut(inner)?;
     let fields = match inner {
         Value::Enum { fields, .. } => fields,
         _ => return None,
     };
-    let leaf = unwrap1_mut(unwrap1_mut(fields.get_mut(field)?)?)?;
-    match leaf {
-        Value::Uint(n) => Some(n),
-        _ => None,
+    // Descend the count cell's one-field wrappers (see
+    // `count_leaf`) to the count itself.
+    let mut leaf = fields.get_mut(field)?;
+    loop {
+        match leaf {
+            Value::Uint(n) => return Some(n),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                leaf = &mut fields[0];
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -1815,11 +1926,9 @@ impl<'a> Interpreter<'a> {
         // (a `CString` value, above all), and reading it as a
         // handle would name a position inside its buffer
         // instead of the value itself.
-        if let Some(id) = self.rc_inner_id(base) {
-            return Value::Ref(RefTarget::Alloc {
-                id,
-                projection: vec![RefProj::Field(2)],
-            });
+        if let Some((id, mut projection)) = self.rc_inner_loc(base) {
+            projection.push(RefProj::Field(2));
+            return Value::Ref(RefTarget::Alloc { id, projection });
         }
         // The outermost aggregate decides what the base is (the
         // discrimination `deref_value` applies to a `DynRef`
