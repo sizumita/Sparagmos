@@ -1659,6 +1659,195 @@ fn index_mut_writes_a_vec_element() {
 }
 
 #[test]
+fn index_mut_writes_a_boxed_vec_element() {
+    // fn main() -> i32 {
+    //   _1 = Vec::new(); push 10; push 20;
+    //   _6 = Box::new(move _1);
+    //   _8 = IndexMut::index_mut(&mut *_6, 1);
+    //   *_8 = 99;
+    //   _10 = Index::index(&*_6, 1);
+    //   return *_10;
+    // }
+    // The receiver dereferences a `Box`, so it resolves to the
+    // box's allocation, whose value is the vector aggregate:
+    // indexing it must be runtime-supported exactly as indexing
+    // a vector in a local place is.
+    let box_vec_ty = mir::Ty::Adt(BOX_TY, vec![vec_i32_ty()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            vec_i32_ty(),
+            ref_ty(vec_i32_ty(), true),
+            mir::Ty::unit(),
+            ref_ty(vec_i32_ty(), true),
+            mir::Ty::unit(),
+            box_vec_ty.clone(),
+            ref_ty(vec_i32_ty(), true),
+            ref_ty(i32_ty(), true),
+            ref_ty(vec_i32_ty(), false),
+            ref_ty(i32_ty(), false),
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(VEC_NEW, vec![i32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_PUSH, vec![i32_ty()]),
+                    vec![move_(2), const_i32(10)],
+                    3,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_PUSH, vec![i32_ty()]),
+                    vec![move_(4), const_i32(20)],
+                    5,
+                    3,
+                ),
+            ),
+            block(
+                vec![],
+                call(fndef(BOX_NEW, vec![vec_i32_ty()]), vec![move_(1)], 6, 4),
+            ),
+            block(
+                vec![assign(
+                    place(7),
+                    mir::Rvalue::Ref(
+                        mir::Region::Erased,
+                        mir::BorrowKind::Mut {
+                            allow_two_phase_borrow: false,
+                        },
+                        deref_place(6),
+                    ),
+                )],
+                call(
+                    fndef(INDEX_MUT, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(7), const_usize(1)],
+                    8,
+                    5,
+                ),
+            ),
+            block(
+                vec![
+                    assign(deref_place(8), mir::Rvalue::Use(const_i32(99))),
+                    assign(
+                        place(9),
+                        mir::Rvalue::Ref(
+                            mir::Region::Erased,
+                            mir::BorrowKind::Shared,
+                            deref_place(6),
+                        ),
+                    ),
+                ],
+                call(
+                    fndef(INDEX, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(9), const_usize(1)],
+                    10,
+                    6,
+                ),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(deref_place(10))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(99));
+}
+
+#[test]
+fn index_mut_writes_a_boxed_adt_element() {
+    // fn main() -> i32 {
+    //   _1 = Pair(10, 20);
+    //   _3 = Box::new(move _1);
+    //   _5 = IndexMut::index_mut(&mut *_3, 1);
+    //   *_5 = 99;
+    //   _7 = Index::index(&*_3, 1);
+    //   return *_7;
+    // }
+    // An ADT aggregate in a box's allocation indexes by its
+    // field positions, exactly as the same aggregate in a local
+    // place does.
+    let pair_ty = mir::Ty::Adt(PAIR_TY, vec![]);
+    let box_pair_ty = mir::Ty::Adt(BOX_TY, vec![pair_ty.clone()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            pair_ty.clone(),
+            mir::Ty::unit(),
+            box_pair_ty.clone(),
+            ref_ty(pair_ty.clone(), true),
+            ref_ty(i32_ty(), true),
+            ref_ty(pair_ty.clone(), false),
+            ref_ty(i32_ty(), false),
+        ]),
+        0,
+        vec![
+            block(
+                vec![assign(
+                    place(1),
+                    adt_aggregate(PAIR_TY, 0, vec![], vec![const_i32(10), const_i32(20)]),
+                )],
+                call(fndef(BOX_NEW, vec![pair_ty.clone()]), vec![move_(1)], 3, 1),
+            ),
+            block(
+                vec![assign(
+                    place(4),
+                    mir::Rvalue::Ref(
+                        mir::Region::Erased,
+                        mir::BorrowKind::Mut {
+                            allow_two_phase_borrow: false,
+                        },
+                        deref_place(3),
+                    ),
+                )],
+                call(
+                    fndef(INDEX_MUT, vec![pair_ty.clone(), usize_ty()]),
+                    vec![move_(4), const_usize(1)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![
+                    assign(deref_place(5), mir::Rvalue::Use(const_i32(99))),
+                    assign(
+                        place(6),
+                        mir::Rvalue::Ref(
+                            mir::Region::Erased,
+                            mir::BorrowKind::Shared,
+                            deref_place(3),
+                        ),
+                    ),
+                ],
+                call(
+                    fndef(INDEX, vec![pair_ty, usize_ty()]),
+                    vec![move_(6), const_usize(1)],
+                    7,
+                    3,
+                ),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(deref_place(7))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(99));
+}
+
+#[test]
 fn index_mut_range_full_writes_through_the_fat_ref() {
     // fn main() -> i32 {
     //   _1 = [1, 2, 3];

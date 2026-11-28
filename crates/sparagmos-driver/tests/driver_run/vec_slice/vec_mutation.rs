@@ -504,3 +504,47 @@ fn run_mode_nested_vec_push_after_outer_truncate() {
         "[[[7, 8, 10]]]\n",
     );
 }
+
+const BOXED_INDEX_MUT_SRC: &str = r#"
+use std::ops::{Deref, DerefMut};
+
+struct Wrap(Vec<i32>);
+
+impl Deref for Wrap {
+    type Target = Vec<i32>;
+    fn deref(&self) -> &Vec<i32> {
+        &self.0
+    }
+}
+
+impl DerefMut for Wrap {
+    fn deref_mut(&mut self) -> &mut Vec<i32> {
+        &mut self.0
+    }
+}
+
+fn main() {
+    // Indexing a vector through a `Box` dereference: the
+    // receiver of `IndexMut::index_mut` resolves to the box's
+    // allocation, whose value is the vector itself.
+    let mut b = Box::new(vec![10, 20, 30]);
+    b[1] = 99;
+    println!("boxed={}", b[1]);
+
+    // The same through a user `DerefMut` wrapper held in a
+    // `Box`: the ADT value in the allocation is the indexing
+    // base.
+    let mut w = Box::new(Wrap(vec![1, 2, 3]));
+    w[2] = 42;
+    println!("wrap={}", w[2]);
+}
+"#;
+
+#[test]
+fn run_mode_index_mut_on_boxed_vec_and_adt() {
+    run_ok(
+        "boxed-index-mut",
+        BOXED_INDEX_MUT_SRC,
+        "boxed=99\nwrap=42\n",
+    );
+}
