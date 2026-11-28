@@ -1546,6 +1546,23 @@ pub enum DropPlan {
         path: Vec<RefProj>,
         plan: Box<DropPlan>,
     },
+    /// Run `plan` against a copy of the value this plan applies
+    /// to, materialised in a fresh allocation of its own: the
+    /// value is a field whose address inside its parent is not
+    /// guaranteed aligned for its type -- a field of a
+    /// `repr(packed)` parent, whose own alignment is the pack
+    /// cap, or a field at an offset the type's alignment does
+    /// not divide. The compiler's drop glue drops such a field
+    /// from an aligned temporary it first moves the field into,
+    /// so the field's destructor observes the temporary's
+    /// address -- and writes back into its receiver land in the
+    /// temporary -- never the field's own unaligned address.
+    /// Conversion wraps a field's plan in this node exactly
+    /// when the field type's alignment fails to divide the
+    /// parent's alignment or the field's offset; a field whose
+    /// address is guaranteed aligned drops in place, as every
+    /// other field does.
+    AlignedTemp { plan: Box<DropPlan> },
     /// Call the converted destructor body `func` (a program key) with
     /// a `&mut` reference to the value this plan applies to.
     CallDtor { func: String },

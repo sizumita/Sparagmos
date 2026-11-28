@@ -1245,6 +1245,10 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
             ir::DropPlan::Seq(plans) => plans.iter().all(|p| walk(p, adts, targets, seen)),
             ir::DropPlan::At { plan, .. } => walk(plan, adts, targets, seen),
+            // The aligned-temporary copy changes where the plan
+            // runs, not which destructor bodies it can call: the
+            // edges are the subplan's.
+            ir::DropPlan::AlignedTemp { plan } => walk(plan, adts, targets, seen),
             ir::DropPlan::CallDtor { func } | ir::DropPlan::GuardDtor { func } => {
                 targets.push(func.as_str());
                 true

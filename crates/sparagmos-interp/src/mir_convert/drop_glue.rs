@@ -1603,6 +1603,73 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         }
     }
 
+    /// Wrap one field's glue in an [`ir::DropPlan::AlignedTemp`]
+    /// node when the field's address inside its parent ADT is
+    /// not guaranteed aligned for the field's type: the type's
+    /// alignment must divide both the parent's own alignment
+    /// and the field's recorded offset, and a `repr(packed)`
+    /// parent's alignment is its pack cap, so its fields are
+    /// never guaranteed. The compiler's drop glue drops such a
+    /// field from an aligned temporary (see the plan node's
+    /// doc), so the plan must not run against the field's own
+    /// address. The judgment reads the recorded layout tables:
+    /// the parent instance's layout and field offsets and the
+    /// field type's layout. When any is unrecorded the field
+    /// keeps the in-place plan: an unrecorded layout leaves
+    /// nothing to judge by.
+    fn aligned_temp_wrap(
+        &self,
+        def: mir::DefId,
+        args: &[mir::Ty],
+        variant: u32,
+        field: u32,
+        field_ty: &mir::Ty,
+        plan: ir::DropPlan,
+    ) -> ir::DropPlan {
+        use ir::DropPlan as P;
+        if matches!(plan, P::Trivial) {
+            return plan;
+        }
+        let conv = self.conv;
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(def, args.to_vec()),
+            conv.names,
+        );
+        let Some(variants) = conv.adt_field_layouts.get(&tag) else {
+            return plan;
+        };
+        let Some(variant_fields) = variants.get(variant as usize) else {
+            return plan;
+        };
+        let Some(&(offset, _)) = variant_fields.get(field as usize)
+        else {
+            return plan;
+        };
+        let Some((_, align)) = conv.ty_layout(field_ty) else {
+            return plan;
+        };
+        let Some(&(_, parent_align)) = conv.adt_layouts.get(&tag)
+        else {
+            return plan;
+        };
+        // The field's address is its parent's base plus the
+        // offset: it is aligned for the field's type only when
+        // the type's alignment divides both the parent's own
+        // alignment (the guarantee the base carries) and the
+        // offset. A `repr(packed)` parent's alignment is its
+        // pack cap, so its fields fail the first condition
+        // whatever their offsets -- a packed struct can sit at
+        // any residue, and the compiler's glue drops its fields
+        // from aligned temporaries for exactly that reason.
+        if align > 1 && (offset % align != 0 || parent_align % align != 0) {
+            P::AlignedTemp {
+                plan: Box::new(plan),
+            }
+        } else {
+            plan
+        }
+    }
+
     /// The field glue of one variant of one ADT. With
     /// `shape_fallback`, the driver's shape table — which declares
     /// every field of the variant with its type — fills in what
@@ -1649,7 +1716,10 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             match conv.adt_fields.get(def, args, variant, f) {
                 Some(ty) => {
                     let ty = ty.clone();
-                    fields.push(self.plan(&ty)?);
+                    let plan = self.plan(&ty)?;
+                    fields.push(self.aligned_temp_wrap(
+                        def, args, variant, f, &ty, plan,
+                    ));
                 }
                 None => match shape_fields
                     .as_ref()
@@ -1662,9 +1732,11 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                         // part the builder cannot account for keeps
                         // the runtime judgment an unrecorded field
                         // gets, rather than failing the whole glue.
-                        fields.push(
-                            self.plan(&ty).unwrap_or(ir::DropPlan::Untyped),
-                        );
+                        let plan =
+                            self.plan(&ty).unwrap_or(ir::DropPlan::Untyped);
+                        fields.push(self.aligned_temp_wrap(
+                            def, args, variant, f, &ty, plan,
+                        ));
                     }
                     None => {
                         // No projection anywhere records this
