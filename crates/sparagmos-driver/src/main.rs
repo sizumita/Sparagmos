@@ -1461,14 +1461,10 @@ fn driver_main_inner() {
         while let Some(a) = args_iter.next() {
             if a == "--extern" {
                 if let Some(spec) = args_iter.next() {
-                    if let Some((name, _)) = spec.split_once('=') {
-                        bound.insert(name.to_string());
-                    }
+                    bound.insert(extern_spec_crate_name(spec).to_string());
                 }
             } else if let Some(spec) = a.strip_prefix("--extern=") {
-                if let Some((name, _)) = spec.split_once('=') {
-                    bound.insert(name.to_string());
-                }
+                bound.insert(extern_spec_crate_name(spec).to_string());
             }
         }
         for (name, rmeta, rlib) in sysroot_extern_pins(&sysroot, &main_text) {

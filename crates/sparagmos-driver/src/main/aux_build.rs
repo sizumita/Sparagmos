@@ -159,6 +159,25 @@ pub(crate) fn locator_extern_names(flags: &[String]) -> Vec<String> {
     names
 }
 
+/// The crate name an `--extern` spec binds, under rustc's own
+/// grammar (`split_extern_opt` in rustc_session): the part
+/// before the first `=`, with an options prefix (`priv:`,
+/// `priv,noprelude:`) stripped at the first `:`. A remainder
+/// starting with `:` is a namespaced-crates path (`my_api::utils`),
+/// not options, and the whole head is the name. Callers that
+/// compare a spec against plain crate names (the sysroot pin
+/// scan in main.rs) need this form: a cargo build-std invocation
+/// binds std's private dependencies as `--extern priv:miniz_oxide=
+/// <path>`, and recording the name verbatim (`priv:miniz_oxide`)
+/// misses the comparison against the declared `miniz_oxide`.
+pub(crate) fn extern_spec_crate_name(spec: &str) -> &str {
+    let head = spec.split('=').next().unwrap_or("");
+    match head.split_once(':') {
+        Some((_, rest)) if !rest.starts_with(':') => rest,
+        _ => head,
+    }
+}
+
 /// The subset of a source's declarations that are true
 /// `--extern` binding declarations: the names of its
 /// `//@ aux-crate:` directives, verbatim (modifiers and
@@ -1285,4 +1304,32 @@ fn extra_filename_suffix(args: &[String]) -> Option<String> {
         }
     }
     suffix
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extern_spec_crate_name;
+
+    #[test]
+    fn extern_spec_names_follow_rustc_grammar() {
+        // A plain binding.
+        assert_eq!(extern_spec_crate_name("miniz_oxide=/p/lib.rmeta"), "miniz_oxide");
+        // Cargo's build-std form for std's private dependencies.
+        assert_eq!(
+            extern_spec_crate_name("priv:miniz_oxide=/p/libminiz_oxide.rmeta"),
+            "miniz_oxide"
+        );
+        // A multi-option prefix.
+        assert_eq!(
+            extern_spec_crate_name("priv,noprelude:core=/p/libcore.rlib"),
+            "core"
+        );
+        // A namespaced-crates path is a name, not options.
+        assert_eq!(
+            extern_spec_crate_name("my_api::utils=/p/lib.rlib"),
+            "my_api::utils"
+        );
+        // No path at all.
+        assert_eq!(extern_spec_crate_name("core"), "core");
+    }
 }
