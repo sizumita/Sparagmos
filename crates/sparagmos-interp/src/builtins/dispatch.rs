@@ -8072,6 +8072,12 @@ impl<'a> Interpreter<'a> {
                 let target = self.deref_value(frames, &vals[0])?;
                 let exact = name.ends_with("reserve_exact");
                 self.modify_resolved(frames, &target, |slot| {
+                    // A reserve on a string's vector place is
+                    // the entry of a body-level raw-parts walk
+                    // over the string: the walk operates on the
+                    // vector slot the raw-parts entry prepares
+                    // (see `raw_parts_vec_slot`).
+                    let slot = self.raw_parts_vec_slot(slot);
                     vec_ensure_capacity(self, slot, additional, exact, &uninit_elem, elem_size);
                     Ok(Value::Unit)
                 })
@@ -8134,6 +8140,10 @@ impl<'a> Interpreter<'a> {
                     let target = self.deref_value(frames, &vals[0])?;
                     let exact = name.ends_with("try_reserve_exact");
                     self.modify_resolved(frames, &target, |slot| {
+                        // As in `VecReserve` above: a reserve
+                        // on a string's vector place opens a
+                        // body-level raw-parts walk.
+                        let slot = self.raw_parts_vec_slot(slot);
                         vec_ensure_capacity(
                             self,
                             slot,
@@ -8496,14 +8506,16 @@ impl<'a> Interpreter<'a> {
             | Builtin::StrTrimMatches(_) => {
                 arity(2)?;
                 let text_of = |v: &Value| -> InterpResult<String> {
+                    // The text an argument denotes, in every
+                    // form a string place can hold: the abstract
+                    // form, the real aggregate form (the shape
+                    // a body-built or raw-parts-materialised
+                    // string takes) and the element form, read
+                    // through the one string reader; a byte
+                    // string denotes its lossy text.
                     match self.resolve_value(frames, v)? {
-                        Value::Str(s) => Ok(s),
                         Value::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-                        other => Err(InterpError::type_mismatch(
-                            "str pattern argument",
-                            "string value",
-                            other.kind_name(),
-                        )),
+                        _ => self.resolve_string(frames, v),
                     }
                 };
                 let haystack = text_of(&vals[0])?;
@@ -8521,6 +8533,21 @@ impl<'a> Interpreter<'a> {
                     Pred(Value),
                 }
                 let resolved = self.resolve_value(frames, &vals[1])?;
+                // A string pattern held in an aggregate form
+                // (the real aggregate a body-built or
+                // raw-parts-materialised string takes, or the
+                // element form): its text is the needle, read
+                // through the string reader before the value
+                // arms below judge the shape. Any other
+                // aggregate (a boxed predicate, above all)
+                // does not read as a string and keeps the
+                // arms' own judgement.
+                let aggregate_text = match &resolved {
+                    Value::Enum { .. } => {
+                        self.resolve_string(frames, &vals[1]).ok()
+                    }
+                    _ => None,
+                };
                 // A trait-object predicate is resolved through
                 // the dyn callable machinery in the match below;
                 // it records the environment its base denotes
@@ -8535,6 +8562,9 @@ impl<'a> Interpreter<'a> {
                 let mut dyn_pred_final: Option<Value> = None;
                 let needle = match resolved {
                     Value::Str(_) | Value::Bytes(_) => Needle::Text(text_of(&vals[1])?),
+                    _ if aggregate_text.is_some() => {
+                        Needle::Text(aggregate_text.clone().unwrap())
+                    }
                     Value::Uint(v) => {
                         // A `&[char]` pattern whose fat base
                         // references an individual element (a

@@ -192,6 +192,22 @@ impl<'a> Interpreter<'a> {
                 // same owned clone (a `Vec<Box<T>>` clone
                 // must not alias the source's boxes).
                 //
+                // A `String` value in its real aggregate form
+                // (the one-field wrapper over the `RawVec` +
+                // length vector a converted body builds) clones
+                // to the abstract string form: the clone owns
+                // its own text, where the structural copy below
+                // would alias the source string's buffer.
+                if self_ty == "std::string::String"
+                    || self_ty == "alloc::string::String"
+                {
+                    if let Some(text) = self.string_from_real_aggregate(
+                        frames.as_slice(),
+                        &value,
+                    )? {
+                        return Ok(Value::Str(text));
+                    }
+                }
                 // A `Vec` value in its real-aggregate form
                 // (the `RawVec` + length pair, as above) does
                 // not hold its elements as fields, so it is

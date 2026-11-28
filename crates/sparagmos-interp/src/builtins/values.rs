@@ -101,7 +101,7 @@ pub(crate) fn vec_real_aggregate_cap(buf: &Value) -> Option<u128> {
 /// `ptr`, with capacity `cap`: the `RawVecInner` triple
 /// (`NonNull` pointer, `UsizeNoHighBit` capacity, the global
 /// allocator marker) plus the trailing `PhantomData`.
-pub(super) fn raw_vec_value(ptr: Value, cap: usize) -> Value {
+pub(crate) fn raw_vec_value(ptr: Value, cap: usize) -> Value {
     Value::Enum {
         variant: 0,
         fields: vec![
