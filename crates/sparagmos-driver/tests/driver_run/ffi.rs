@@ -415,6 +415,109 @@ fn run_mode_ffi_helpers_execute() {
     );
 }
 
+
+const KERNEL32_LAST_ERROR_SRC: &str = r#"
+mod kernel32 {
+    extern "system" {
+        pub fn SetLastError(err: usize);
+        pub fn GetLastError() -> usize;
+    }
+}
+
+fn main() {
+    unsafe {
+        assert_eq!(kernel32::GetLastError(), 0);
+        let expected = 1234;
+        kernel32::SetLastError(expected);
+        let actual = kernel32::GetLastError();
+        println!("actual = {}", actual);
+        assert_eq!(expected, actual);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_kernel32_last_error_round_trips() {
+    // The shape of `tests/ui/abi/x86stdcall.rs`: the guest's
+    // own `kernel32` module declares the Win32 last-error pair
+    // as body-less `extern "system"` functions; the
+    // interpreter serves them from the foreign-helper models.
+    let dir = temp_dir("kernel32-last-error");
+    let src = fixture(&dir, "kernel32_last_error.rs", KERNEL32_LAST_ERROR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "kernel32 last-error calls must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "actual = 1234\n");
+}
+
+const KERNEL32_HEAP_SRC: &str = r#"
+pub type HANDLE = usize;
+pub type DWORD = u32;
+pub type SIZE_T = u32;
+pub type LPVOID = usize;
+pub type BOOL = u8;
+
+mod kernel32 {
+    use super::{BOOL, DWORD, HANDLE, LPVOID, SIZE_T};
+
+    extern "system" {
+        pub fn GetProcessHeap() -> HANDLE;
+        pub fn HeapAlloc(hHeap: HANDLE, dwFlags: DWORD, dwBytes: SIZE_T) -> LPVOID;
+        pub fn HeapFree(hHeap: HANDLE, dwFlags: DWORD, lpMem: LPVOID) -> BOOL;
+    }
+}
+
+fn main() {
+    unsafe {
+        let heap = kernel32::GetProcessHeap();
+        assert!(heap != 0);
+        assert_eq!(heap, kernel32::GetProcessHeap());
+        let mem = kernel32::HeapAlloc(heap, 0, 100);
+        assert!(mem != 0);
+        // The block is writable storage at its address.
+        let byte = mem as *mut u8;
+        *byte = 42;
+        assert_eq!(*byte, 42);
+        // HEAP_ZERO_MEMORY (0x8) zero-fills the block.
+        let zeroed = kernel32::HeapAlloc(heap, 0x8, 16);
+        assert!(zeroed != 0);
+        assert_eq!(*(zeroed as *const u8), 0);
+        let res = kernel32::HeapFree(heap, 0, mem);
+        assert!(res != 0);
+        assert!(kernel32::HeapFree(heap, 0, zeroed) != 0);
+        // An unknown heap handle fails with NULL, and
+        // freeing a word that names no heap block fails
+        // with 0, as the real calls do.
+        assert_eq!(kernel32::HeapAlloc(0, 0, 100), 0);
+        assert_eq!(kernel32::HeapFree(heap, 0, 0), 0);
+    }
+    println!("kernel32 heap ok");
+}
+"#;
+
+#[test]
+fn run_mode_kernel32_process_heap_allocates_and_frees() {
+    // The shape of `tests/ui/abi/x86stdcall2.rs`: the guest's
+    // own `kernel32` module declares the Win32 process-heap
+    // family as body-less `extern "system"` functions; the
+    // interpreter serves them from the foreign-helper models
+    // over its allocation store.
+    let dir = temp_dir("kernel32-heap");
+    let src = fixture(&dir, "kernel32_heap.rs", KERNEL32_HEAP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "kernel32 heap calls must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "kernel32 heap ok\n");
+}
+
 const FFI_STRUCT_SRC: &str = r#"
 #[link(name = "rust_test_helpers", kind = "static")]
 extern "C" {

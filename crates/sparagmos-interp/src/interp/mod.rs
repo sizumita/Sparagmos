@@ -991,6 +991,20 @@ pub struct Interpreter<'a> {
     /// value's drop glue has run, so a live entry always denotes
     /// a live allocation.
     address_owners: std::cell::RefCell<HashMap<u64, u64>>,
+    /// The last-error code of the modelled Win32 `kernel32`
+    /// pair (`SetLastError` / `GetLastError`, see
+    /// `Builtin::Win32SetLastError`): one word per run. The
+    /// real code is per-thread; the modelled foreign calls
+    /// are served for the run as a whole, so the run's word
+    /// is the faithful granularity here.
+    pub(crate) win32_last_error: std::cell::Cell<u128>,
+    /// The allocation denoting the process heap of the
+    /// modelled Win32 heap family (`GetProcessHeap` /
+    /// `HeapAlloc` / `HeapFree`, see
+    /// `Builtin::Win32GetProcessHeap`), created on first
+    /// use. The handle the guest passes back is the block's
+    /// synthetic address.
+    pub(crate) win32_process_heap: std::cell::RefCell<Option<u64>>,
     /// Allocations created by the raw allocator builtins
     /// (`__rust_alloc` and friends): their content is an
     /// element tuple (or a zeroed byte block), and a pointer
@@ -1839,6 +1853,8 @@ impl<'a> Interpreter<'a> {
             ),
             consumed_iter_final: std::cell::RefCell::new(None),
             address_owners: std::cell::RefCell::new(HashMap::new()),
+            win32_last_error: std::cell::Cell::new(0),
+            win32_process_heap: std::cell::RefCell::new(None),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             exposed_targets: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
