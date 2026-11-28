@@ -245,3 +245,50 @@ fn main() {
 fn run_mode_vec_insert_mut_at_end_returns_the_inserted_ref() {
     run_ok("vec-insert-mut-at-end", INSERT_MUT_AT_END_SRC, "[1, 2, 3, 10]\n");
 }
+
+const LARGE_CONTAINER_PLACE_PROBES_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    for i in 0..1200 {
+        v.push(i);
+    }
+    let mut total: i32 = 0;
+    for i in 0..1200 {
+        assert_eq!(v.len(), 1200);
+        assert!(v.capacity() >= v.len());
+        total += v[i];
+    }
+    let mut window_total: i32 = 0;
+    let mut start = 0;
+    while start < 1200 {
+        let s = &v[start..start + 100];
+        window_total += s.iter().sum::<i32>();
+        start += 100;
+    }
+    let a = [3i32; 512];
+    let mut arr_total: i32 = 0;
+    for i in 0..512 {
+        arr_total += a[i];
+    }
+    arr_total += a[0] + a[511];
+    println!("total={} window={} arr={} first={} last={}", total, window_total, arr_total, v[0], v[1199]);
+}
+"#;
+
+#[test]
+fn run_mode_large_container_place_probes() {
+    // Regression for #399: resolving a place into a large
+    // container (a Vec length/capacity field, a constant index,
+    // a subslice) judged the position by reading the container
+    // value -- and the owned read cloned the whole container on
+    // every step, so element work over a large buffer cost the
+    // buffers length per access. Those judgments now read by
+    // reference (read_resolved_peek); the accesses above run
+    // the shapes repeatedly over a 1,200-element vector and a
+    // 512-element array and must stay correct.
+    run_ok(
+        "large-container-place-probes",
+        LARGE_CONTAINER_PLACE_PROBES_SRC,
+        "total=719400 window=719400 arr=1542 first=0 last=1199\n",
+    );
+}

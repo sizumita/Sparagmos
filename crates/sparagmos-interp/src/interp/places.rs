@@ -226,7 +226,7 @@ impl<'a> Interpreter<'a> {
                                 place,
                             )?;
                             let count = self
-                                .read_resolved(frames, &vec_target)?
+                                .read_resolved_peek(frames, &vec_target)?
                                 .len()
                                 .ok_or_else(|| {
                                     InterpError::type_mismatch(
@@ -273,7 +273,7 @@ impl<'a> Interpreter<'a> {
                         // the stored elements, spare capacity
                         // included, so the answer does not move
                         // when the length does.
-                        let held = self.read_resolved(frames, &cur)?;
+                        let held = self.read_resolved_peek(frames, &cur)?;
                         let count = match Self::real_vec_cap(&held) {
                             // A vector in its real aggregate
                             // form holds the capacity in the
@@ -326,7 +326,7 @@ impl<'a> Interpreter<'a> {
                     } else if *idx == 1
                         && cur_ty.as_ref().is_some_and(is_vec_adt_ty)
                     {
-                        let held = self.read_resolved(frames, &cur)?;
+                        let held = self.read_resolved_peek(frames, &cur)?;
                         let count = match crate::builtins::vec_real_aggregate_parts(
                             &held,
                         ) {
@@ -366,7 +366,7 @@ impl<'a> Interpreter<'a> {
                     {
                         // The suspected vector's length slot,
                         // read as for a named `Vec` position.
-                        let held = self.read_resolved(frames, &cur)?;
+                        let held = self.read_resolved_peek(frames, &cur)?;
                         let count = match crate::builtins::vec_real_aggregate_parts(
                             &held,
                         ) {
@@ -397,7 +397,7 @@ impl<'a> Interpreter<'a> {
                             body,
                             place,
                         )?;
-                        match self.read_resolved(frames, &stepped) {
+                        match self.read_resolved_peek(frames, &stepped) {
                             Ok(v) if is_byte_vec_value(&v) => {
                                 pending_vec = Some(cur.clone());
                                 cur
@@ -582,7 +582,7 @@ impl<'a> Interpreter<'a> {
                     // for any other unwritten slot.
                     let len = match fat_cap.or(ty_len) {
                         Some(cap) => Some(cap),
-                        None => match self.read_resolved(frames, &cur) {
+                        None => match self.read_resolved_peek(frames, &cur) {
                             Ok(v) => Some(v.len().ok_or_else(|| {
                                 InterpError::type_mismatch(
                                     format!("constant index into {place}"),
@@ -713,7 +713,7 @@ impl<'a> Interpreter<'a> {
                     // knowledge of the MIR range shape.
                     let len = match fat_cap.or(ty_len) {
                         Some(cap) => Some(cap),
-                        None => match self.read_resolved(frames, &cur) {
+                        None => match self.read_resolved_peek(frames, &cur) {
                             Ok(v) => Some(v.len().ok_or_else(|| {
                                 InterpError::type_mismatch(
                                     format!("subslice of {place}"),
@@ -1036,7 +1036,7 @@ impl<'a> Interpreter<'a> {
                                 match fat_element_anchor(&resolved) {
                                     Some((container, depth)) => {
                                         let spans = self
-                                            .read_resolved(frames, &container)
+                                            .read_resolved_peek(frames, &container)
                                             .ok()
                                             .and_then(|v| v.len())
                                             .is_some_and(|len| Some(len) == fat_cap);
@@ -1103,7 +1103,7 @@ impl<'a> Interpreter<'a> {
                                     .map_or(0, |ty| self.sequence_wrapper_depth(ty));
                                 if depth > 0
                                     && self
-                                        .read_resolved(frames, &resolved)
+                                        .read_resolved_peek(frames, &resolved)
                                         .ok()
                                         .and_then(|v| v.len())
                                         == fat_cap
@@ -1170,7 +1170,7 @@ impl<'a> Interpreter<'a> {
         if buf_depth > 0 {
             if let Some(base) = buf_base.take() {
                 let real_form = matches!(
-                    self.read_resolved(frames, &base),
+                    self.read_resolved_peek(frames, &base),
                     Ok(held)
                         if crate::builtins::vec_real_aggregate_parts(&held)
                             .is_some()
@@ -1264,7 +1264,7 @@ impl<'a> Interpreter<'a> {
             Resolved::Alloc { id, projection }
                 if projection.is_empty() && self.is_elem_block(*id) =>
             {
-                self.read_resolved(
+                self.read_resolved_peek(
                     frames,
                     &Resolved::Alloc {
                         id: *id,
@@ -1272,7 +1272,7 @@ impl<'a> Interpreter<'a> {
                     },
                 )
             }
-            _ => self.read_resolved(frames, cur),
+            _ => self.read_resolved_peek(frames, cur),
         };
         match cur_ty {
             Some(Ty::Adt(name)) => {
@@ -1286,14 +1286,14 @@ impl<'a> Interpreter<'a> {
                     return false;
                 }
                 matches!(
-                    position_value,
+                    position_value.as_deref(),
                     Ok(Value::Tuple(_) | Value::Bytes(_))
                 )
             }
             Some(Ty::Tuple(ts))
                 if ts.len() == 1 && matches!(ts[0], Ty::Array(..)) =>
             {
-                match position_value {
+                match position_value.as_deref() {
                     Ok(Value::Bytes(_)) => true,
                     Ok(Value::Tuple(items)) => items.len() != 1,
                     _ => false,
@@ -2151,7 +2151,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         base: &Resolved,
     ) -> InterpResult<Resolved> {
-        if let Ok(held) = self.read_resolved(frames, base) {
+        if let Ok(held) = self.read_resolved_peek(frames, base) {
             if crate::builtins::vec_real_aggregate_parts(&held).is_some() {
                 if let Some(ptr) = Self::real_vec_buffer_ptr(&held) {
                     return Ok(Resolved::Value(ptr, Vec::new()));
@@ -2740,9 +2740,9 @@ impl<'a> Interpreter<'a> {
             return None;
         }
         let target = self.deref_value(frames, &head).ok()?;
-        let pointee = self.read_resolved(frames, &target).ok()?;
-        match pointee {
-            Value::FatRef { len, .. } => Some(len),
+        let pointee = self.read_resolved_peek(frames, &target).ok()?;
+        match &*pointee {
+            Value::FatRef { len, .. } => Some(*len),
             _ => None,
         }
     }
