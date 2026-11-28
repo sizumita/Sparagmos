@@ -6,7 +6,8 @@
 //! reinterpretation (width-crossing array regrouping at any
 //! total width, with per-element uninit propagation), the
 //! wrapped-array and `Simd<T, N>` storage crossings, the
-//! fat-pointer <-> DST-wrapper-struct identity, the formatting
+//! fat-pointer <-> DST-wrapper-struct identity (for place
+//! and constant operands alike), the formatting
 //! of a DST struct str tail field, the
 //! (pointer, length) tuple <-> fat reference crossing, and
 //! the thin pointer <-> union crossing, and the raw-pointer
@@ -402,6 +403,63 @@ fn main() {
 "#,
     );
     assert_eq!(stdout, "42\n11\n42\n42\n");
+}
+
+/// A string *constant* transmuted straight into a
+/// DST-wrapper reference (Issue #391): the constant operand
+/// carries no place type, so the conversion used to decline
+/// the cast (`unsupported rvalue: Cast Transmute`) where the
+/// same transmute of a place operand converted. The fat
+/// value itself carries over under the wrapper's declared
+/// type, for the named-field and the tuple-struct forms.
+#[test]
+fn const_str_to_dst_wrapper() {
+    let stdout = run_ok(
+        "const-dst",
+        "const_dst.rs",
+        r#"
+use std::mem;
+struct S { s: str }
+struct T(str);
+fn main() {
+    let w: &S = unsafe { mem::transmute("hello") };
+    println!("{}", &w.s);
+    let t: &T = unsafe { mem::transmute("world") };
+    println!("{}", &t.0);
+}
+"#,
+    );
+    assert_eq!(stdout, "hello\nworld\n");
+}
+
+/// The constant-operand DST-wrapper identity across the
+/// family's other target shapes: a slice-tail wrapper read
+/// through its tail, a raw-pointer target, a `const` item
+/// operand (const propagation folds it to the same constant
+/// form), and the empty string.
+#[test]
+fn const_str_to_dst_wrapper_shapes() {
+    let stdout = run_ok(
+        "const-dst-shapes",
+        "const_dst_shapes.rs",
+        r#"
+use std::mem;
+struct W([u8]);
+struct S { s: str }
+fn main() {
+    let w: &W = unsafe { mem::transmute("hello") };
+    println!("{} {}", w.0.len(), w.0[0] + w.0[4]);
+    let p: *const S = unsafe { mem::transmute("world") };
+    println!("{}", unsafe { &(*p).s });
+    const C: &str = "const!";
+    let w2: &S = unsafe { mem::transmute(C) };
+    println!("{}", &w2.s);
+    let w3: &S = unsafe { mem::transmute("") };
+    println!("[{}]", &w3.s);
+}
+"#,
+    );
+    assert_eq!(stdout, "5 215\nworld\nconst!\n[]\n");
 }
 
 /// DST-wrapper structs over sized storage, reached by
