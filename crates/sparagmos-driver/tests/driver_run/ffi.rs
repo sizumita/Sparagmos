@@ -1805,6 +1805,103 @@ fn run_mode_cstring_from_boxed_cstr_round_trips() {
     );
 }
 
+const CSTRING_LITERAL_TO_OWNED_SRC: &str = r#"
+use std::borrow::Cow;
+use std::ffi::{CStr, CString};
+fn main() {
+    let s = c"hello".to_owned();
+    println!("debug={s:?}");
+    println!("bytes={:?}", s.to_bytes());
+    println!("with_nul={:?}", s.to_bytes_with_nul());
+    let cs: &CStr = &s;
+    println!("len={}", cs.to_bytes().len());
+    let b = s.into_boxed_c_str();
+    println!("boxed={:?}", b.to_bytes());
+    let v: &CStr = c"world";
+    let s2 = v.to_owned();
+    println!("var={:?}", s2.to_bytes());
+    let cow: Cow<'_, CStr> = Cow::Borrowed(c"cow");
+    println!("cow={:?}", cow.into_owned().to_bytes());
+    let e = c"".to_owned();
+    println!("empty={} {:?}", e.to_bytes().len(), e.to_bytes_with_nul());
+    let s3 = c"abc".to_owned();
+    println!("into_string={:?}", s3.into_string().unwrap());
+    let c1 = c"clone".to_owned();
+    let c2 = c1.clone();
+    println!("clone={:?} eq={}", c2.to_bytes(), c1 == c2);
+    let a = c"abd".to_owned();
+    let bb = CString::new("abc").unwrap();
+    println!("ord={:?}", a.cmp(&bb));
+}
+"#;
+
+#[test]
+fn run_mode_cstring_literal_to_owned_derefs() {
+    // `ToOwned::to_owned` for a `CStr` receiver returned
+    // the receiver's own aggregate verbatim: the C string
+    // aggregate's single field is the byte string itself,
+    // where the `CString`'s field is the owned box, so the
+    // length-trusting consumers (`Deref` to `&CStr`, and
+    // through it `to_bytes` / `to_bytes_with_nul` /
+    // `into_boxed_c_str` / `into_string`) stopped with a
+    // type mismatch, while the byte-scanning consumers
+    // (Debug, equality, ordering) read through the
+    // aggregate and hid the defect. The builtin now builds
+    // the owned form the way `c_string_value` builds every
+    // other modelled `CString`.
+    run_ok(
+        "cstring-literal-to-owned",
+        CSTRING_LITERAL_TO_OWNED_SRC,
+        "debug=\"hello\"\nbytes=[104, 101, 108, 108, 111]\nwith_nul=[104, 101, 108, 108, 111, 0]\nlen=5\nboxed=[104, 101, 108, 108, 111]\nvar=[119, 111, 114, 108, 100]\ncow=[99, 111, 119]\nempty=0 [0]\ninto_string=\"abc\"\nclone=[99, 108, 111, 110, 101] eq=true\nord=Greater\n",
+    );
+}
+
+const CSTRING_FROM_REF_CSTR_SRC: &str = r#"
+use std::ffi::{CStr, CString};
+fn main() {
+    let a = CString::from(c"world");
+    println!("lit={:?} {:?}", a.to_bytes(), a);
+    let v: &CStr = c"var";
+    let b: CString = v.into();
+    println!("var={:?}", b.to_bytes());
+    let host = CString::new("hi").unwrap();
+    let r: &CStr = &host;
+    let c = r.to_owned();
+    println!("refat={:?}", c.to_bytes());
+    let raw = CStr::from_bytes_with_nul(b"x\x80y\0").unwrap();
+    let n = raw.to_owned();
+    println!("nonascii={:?}", n.to_bytes_with_nul());
+    println!("lossy={}", n.to_string_lossy());
+    println!("str={:?}", v.to_str().unwrap());
+    let rt = c"rt".to_owned().into_boxed_c_str();
+    let back = CString::from(rt);
+    println!("roundtrip={:?}", back.to_bytes());
+    let bad = CStr::from_bytes_with_nul(b"\xff\0").unwrap().to_owned();
+    match bad.into_string() {
+        Ok(_) => println!("unexpected ok"),
+        Err(e) => println!("err_back={:?}", e.into_cstring().to_bytes()),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_cstring_from_borrowed_cstr() {
+    // `CString: From<&CStr>` had no arm in the generic
+    // conversion and stopped as not runtime-supported; it
+    // is the owned C string over the borrowed one's bytes,
+    // built by the same `c_string_value` as the
+    // `Box<CStr>` source. The guest also covers the byte
+    // readers over the C string aggregate shape a literal's
+    // place holds (`to_str`, `to_string_lossy` on a
+    // literal-backed `&CStr` read the aggregate's field
+    // list as a single "element" before and stopped).
+    run_ok(
+        "cstring-from-ref-cstr",
+        CSTRING_FROM_REF_CSTR_SRC,
+        "lit=[119, 111, 114, 108, 100] \"world\"\nvar=[118, 97, 114]\nrefat=[104, 105]\nnonascii=[120, 128, 121, 0]\nlossy=x\u{fffd}y\nstr=\"var\"\nroundtrip=[114, 116]\nerr_back=[255]\n",
+    );
+}
+
 #[test]
 fn run_mode_cow_cstr_owned_drop_converts() {
     // The owned variant of the same drop: the `CString` is

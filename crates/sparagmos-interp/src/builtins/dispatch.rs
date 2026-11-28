@@ -4997,6 +4997,19 @@ impl<'a> Interpreter<'a> {
                         bytes.pop();
                     }
                     Ok(self.c_string_value(bytes))
+                } else if target == "std::ffi::CString"
+                    && (source == "&std::ffi::CStr"
+                        || source == "&core::ffi::CStr"
+                        || source == "std::ffi::CStr"
+                        || source == "core::ffi::CStr")
+                {
+                    // `CString: From<&CStr>` is the owned C
+                    // string over the borrowed one's bytes:
+                    // the terminator is dropped by the reader
+                    // and rebuilt by `c_string_value`, as in
+                    // the `Box<CStr>` arm above.
+                    let bytes = self.c_str_bytes(frames, &value)?;
+                    Ok(self.c_string_value(bytes))
                 } else if (target.starts_with("std::boxed::Box<")
                     || target.starts_with("alloc::boxed::Box<"))
                     && (generic_first_arg(target, "std::boxed::Box<")
@@ -9988,7 +10001,13 @@ impl<'a> Interpreter<'a> {
                 // back the byte sequence itself (a slice's
                 // element list, or the string value), which
                 // the owned type's consumers refuse as a
-                // differently shaped ADT.
+                // differently shaped ADT. The `CStr` case is
+                // the sharpest: the C string aggregate's
+                // single field is the byte string itself,
+                // where the `CString`'s field is the owned
+                // box, and the length-trusting consumers (the
+                // `Deref` to `&CStr` above all) refuse the
+                // byte string where the box belongs.
                 match generic_args.first().map(String::as_str) {
                     Some("std::ffi::OsStr") => {
                         let bytes = self.os_str_bytes(frames, &vals[0])?;
@@ -9998,7 +10017,7 @@ impl<'a> Interpreter<'a> {
                         let bytes = self.os_str_bytes(frames, &vals[0])?;
                         return Ok(pathbuf_value(&bytes));
                     }
-                    Some("std::ffi::CStr") => {
+                    Some("std::ffi::CStr") | Some("core::ffi::CStr") => {
                         let bytes = self.c_str_bytes(frames, &vals[0])?;
                         return Ok(self.c_string_value(bytes));
                     }
