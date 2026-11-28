@@ -1421,6 +1421,31 @@ impl<'a> Interpreter<'a> {
         {
             return resolved;
         }
+        // A target that already holds a sequence of exactly
+        // the declared length denotes the declared array
+        // itself: the position is an element that IS an array
+        // (a nested array's element, reached by a plain borrow
+        // or an iterator over the container), not the first
+        // element of an array carved out of the container's
+        // sequence. Rebasing it to a window over the container
+        // would denominate the array's own elements as the
+        // container's next elements, so the target stands as
+        // it is. (The carve this function windows for names a
+        // scalar at its position: the buffer element the
+        // carved array starts from.)
+        if let Ok(stored) = self.read_resolved_peek(frames, &resolved) {
+            let own_len = match &*stored {
+                Value::Tuple(items) => Some(items.len() as u64),
+                Value::Bytes(bytes) => Some(bytes.len() as u64),
+                Value::SparseVec { len, .. } => {
+                    u64::try_from(*len).ok()
+                }
+                _ => None,
+            };
+            if own_len == Some(len) {
+                return resolved;
+            }
+        }
         // An element position of a longer sequence (the
         // target ends in an index step, the shape a
         // sub-slice's `as_ptr` leaves): the array the
