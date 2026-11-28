@@ -3655,7 +3655,12 @@ impl<'a> Interpreter<'a> {
             Value::Uint(v) => {
                 if pointee_tag(ty) == "char" {
                     let c = as_char(*v)?;
-                    return Ok(pad_str(&format!("{c:?}"), options));
+                    // core's `Debug for char` writes the quoted,
+                    // escaped char directly and never routes
+                    // through the padding machinery, so width and
+                    // precision do not apply (unlike `Display`,
+                    // which pads through `Formatter::pad`).
+                    return Ok(format!("{c:?}"));
                 }
                 if options.flags & DEBUG_LOWER_HEX != 0 {
                     Ok(format_uint_radix(*v, Some(ty), 16, "0x", options))
@@ -3668,13 +3673,13 @@ impl<'a> Interpreter<'a> {
             Value::Bool(b) => Ok(pad_str(bool_str(*b), options)),
             Value::Float(v) => Ok(format_float(*v, ty, options, true)),
             Value::Str(s) => {
-                // Precision truncates the string (in chars) before
-                // it is escaped and quoted.
-                let truncated: String = match options.precision() {
-                    Some(p) => s.chars().take(p as usize).collect(),
-                    None => s.clone(),
-                };
-                Ok(pad_width(&format!("{truncated:?}"), options))
+                // core's `Debug for str` (and for `String`, which
+                // delegates to it) writes the quoted, escaped text
+                // directly and never routes through the padding
+                // machinery, so neither width nor precision
+                // applies (unlike `Display`, which pads and
+                // truncates through `Formatter::pad`).
+                Ok(format!("{s:?}"))
             }
             // A byte block: the storage form of a byte slice or
             // array value (and of a byte-string constant). The
