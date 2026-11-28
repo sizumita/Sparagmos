@@ -17,8 +17,20 @@ name: Auto Merge
 # nothing is armed: it waits for manual handling, and no newer pull
 # request is armed in its place.
 #
-# This workflow only enables auto-merge; whether a pull request
-# actually merges is decided by the required status checks
+# Clean-status handling: GitHub rejects enabling auto-merge on a
+# pull request that is already CLEAN (every required check passed
+# while it waited in the queue) with "Pull request is in clean
+# status". When the selected pull request is CLEAN the workflow
+# therefore merges it directly with a squash merge instead of
+# arming it, and the same direct merge is the fallback when the
+# enable call itself reports the clean status (the state can turn
+# CLEAN between selection and arming). Any other arming failure
+# fails the run.
+#
+# This workflow only enables auto-merge or, for an already-CLEAN
+# pull request, performs the merge the required status checks have
+# already approved; whether a pull request actually merges is
+# decided by the required status checks
 # (build / test / fmt / clippy, driver / corpus (Rust 1.100.0), and
 # the flip-diff gate). It runs on pull_request_target so the
 # definition on main applies to every pull request regardless of
@@ -54,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           oldest="$(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
-            --json number,isDraft,autoMergeRequest,createdAt \
+            --json number,isDraft,autoMergeRequest,createdAt,mergeStateStatus \
             --jq 'sort_by(.createdAt) | .[0] // empty')"
           if [ -z "$oldest" ]; then
             echo "No open pull requests target main; nothing to arm."
@@ -74,5 +86,21 @@ jobs:
             echo "The oldest open pull request #${number} changes .github/workflows/, so auto-merge is not enabled; it is merged manually." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          gh pr merge "$number" --repo "$REPO" --auto --squash
+          state="$(printf '%s' "$oldest" | jq -r '.mergeStateStatus')"
+          if [ "$state" = "CLEAN" ]; then
+            gh pr merge "$number" --repo "$REPO" --squash
+            echo "The oldest open pull request #${number} is already CLEAN, so it was merged directly (squash) instead of arming auto-merge." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! arm_output="$(gh pr merge "$number" --repo "$REPO" --auto --squash 2>&1)"; then
+            printf '%s\n' "$arm_output"
+            if printf '%s\n' "$arm_output" | grep -q 'clean status'; then
+              gh pr merge "$number" --repo "$REPO" --squash
+              echo "Enabling auto-merge for the oldest open pull request #${number} reported the clean status, so it was merged directly (squash)." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Enabling auto-merge for the oldest open pull request #${number} failed." >&2
+            exit 1
+          fi
+          printf '%s\n' "$arm_output"
           echo "Auto-merge (squash) enabled for the oldest open pull request #${number}." >> "$GITHUB_STEP_SUMMARY"
