@@ -595,7 +595,85 @@ impl<'a> Interpreter<'a> {
         if value_fits_ty(core, ty) {
             return core.clone();
         }
+        // An element that arrives in byte form — a scalar leaf
+        // or a byte string the source storage held, where the
+        // copy's element type is an aggregate those bytes
+        // denote (a byte-form `ptr::read` copy out of a byte
+        // array into a typed place): denominate it by
+        // constructing the element type's value from the
+        // element's byte image, the same decoding the byte-view
+        // read paths perform.
+        if let Some(image) = self.copy_element_image(&unit, ty) {
+            if let Some(built) = self.construct_from_bytes(ty, &image) {
+                if value_fits_ty(&built, ty) {
+                    return built;
+                }
+            }
+        }
         unit
+    }
+
+    /// The byte image of one copy element held in byte form:
+    /// a scalar leaf's little-endian pattern at the element
+    /// type's width (the leaf's own bits, extended with the
+    /// sign or zero the leaf's form carries — the width is
+    /// the element type's, the storage the copy priced), or a
+    /// byte string's bytes, its tail past its own length left
+    /// indeterminate. `None` for a value whose form carries
+    /// no byte image a construction could consume, and for a
+    /// byte string longer than the element it would denote.
+    fn copy_element_image(
+        &self,
+        unit: &Value,
+        ty: &Ty,
+    ) -> Option<Vec<Option<u8>>> {
+        let size = usize::try_from(self.ty_size(ty)?).ok()?;
+        let le_bytes = |bits: u128, fill: u8| -> Vec<Option<u8>> {
+            (0..size)
+                .map(|i| {
+                    Some(if i < 16 {
+                        (bits >> (8 * i)) as u8
+                    } else {
+                        fill
+                    })
+                })
+                .collect()
+        };
+        match unit {
+            Value::Uint(v) => Some(le_bytes(*v, 0)),
+            Value::Int(v) => Some(le_bytes(
+                *v as u128,
+                if *v < 0 { 0xff } else { 0 },
+            )),
+            Value::Float(f) => {
+                let bits: u128 = match size {
+                    4 => u128::from((*f as f32).to_bits()),
+                    8 => u128::from(f.to_bits()),
+                    _ => return None,
+                };
+                Some(le_bytes(bits, 0))
+            }
+            Value::Bytes(b) => {
+                if b.len() > size {
+                    return None;
+                }
+                let mut image: Vec<Option<u8>> =
+                    b.iter().map(|x| Some(*x)).collect();
+                image.resize(size, None);
+                Some(image)
+            }
+            Value::Str(s) => {
+                let b = s.as_bytes();
+                if b.len() > size {
+                    return None;
+                }
+                let mut image: Vec<Option<u8>> =
+                    b.iter().map(|x| Some(*x)).collect();
+                image.resize(size, None);
+                Some(image)
+            }
+            _ => None,
+        }
     }
 
     /// `elem` is the copy's element type when the call site knows

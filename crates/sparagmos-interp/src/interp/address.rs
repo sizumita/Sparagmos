@@ -1118,7 +1118,7 @@ impl<'a> Interpreter<'a> {
     /// The (offset, size) of each field of a tuple type under
     /// the declaration-order layout the value model stores
     /// tuples in, and the tuple's total size.
-    fn tuple_layout(&self, ts: &[Ty]) -> Option<(Vec<(u64, u64)>, u64)> {
+    pub(crate) fn tuple_layout(&self, ts: &[Ty]) -> Option<(Vec<(u64, u64)>, u64)> {
         let mut offsets = Vec::with_capacity(ts.len());
         let mut cursor: u128 = 0;
         let mut max_align = 1u64;
