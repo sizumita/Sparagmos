@@ -1494,3 +1494,101 @@ fn run_mode_collect_pairs_iter_any_full_scan() {
         "any-last true\nany-none false\ncount 17\n",
     );
 }
+
+const FN_DEF_STEPPED_ADAPTERS_SRC: &str = r#"
+struct Counter { n: u32, max: u32 }
+
+impl Iterator for Counter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.n < self.max { self.n += 1; Some(self.n) } else { None }
+    }
+}
+
+trait JoinExt: Iterator + Sized {
+    fn join(mut self) -> String
+    where Self::Item: std::fmt::Display {
+        let mut s = String::new();
+        if let Some(e) = self.next() {
+            s.push_str(&e.to_string());
+            for e in self {
+                s.push(',');
+                s.push_str(&e.to_string());
+            }
+        }
+        s
+    }
+}
+
+impl<It> JoinExt for It where It: Iterator {}
+
+fn main() {
+    let chained = Counter { n: 0, max: 2 }.chain(Counter { n: 10, max: 12 }.map(|x| x));
+    println!("chain {}", chained.join());
+    let chained2 = vec![7, 8].into_iter().chain(Counter { n: 20, max: 22 });
+    println!("chain2 {}", chained2.join());
+}
+"#;
+
+#[test]
+fn run_mode_fn_def_stepped_adapters_over_guest_iterator() {
+    // `Chain` steps its first iterator by handing
+    // `Iterator::next` itself to the `and_then_or_clear`
+    // helper as a function item, so a collected `next` body
+    // for it cannot run end to end (no runtime dispatch
+    // serves a trait method held as a value): the run stops
+    // at the bare trait name when the first side is the
+    // guest composition (the example-calendar record), and
+    // silently drops the first side's items when the first
+    // side is a modelled iterator (the `chain2` line). The
+    // demand judgement
+    // must leave `Chain` to the modelled state machine even
+    // over a guest iterator -- the shape of the
+    // example-calendar record, where a generic consumer
+    // (the extension-trait `join` here) drains a `Chain`
+    // whose second half is a `Map` over a guest-defined
+    // iterator (and, mirrored, a guest iterator chained
+    // behind a modelled one).
+    run_ok(
+        "fn-def-stepped-adapters",
+        FN_DEF_STEPPED_ADAPTERS_SRC,
+        "chain 1,2,11,12\nchain2 7,8,21,22\n",
+    );
+}
+
+const ENUMERATE_OVER_GUEST_SRC: &str = r#"
+struct Counter { n: u32, max: u32 }
+
+impl Iterator for Counter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.n < self.max { self.n += 1; Some(self.n) } else { None }
+    }
+}
+
+fn drain<I: Iterator>(mut it: I) -> Vec<I::Item> {
+    let mut v = Vec::new();
+    while let Some(x) = it.next() { v.push(x); }
+    v
+}
+
+fn main() {
+    let e: Vec<(usize, u32)> = drain(Counter { n: 0, max: 3 }.enumerate());
+    println!("enum {e:?}");
+}
+"#;
+
+#[test]
+fn run_mode_enumerate_over_guest_iterator_generic_consumer() {
+    // The shape PR #924's demand arm exists for: an
+    // `Enumerate` over a guest-defined iterator, drained by a
+    // generic consumer. The adapter's own `next` body calls
+    // the inner `next` directly, so collecting it is what
+    // demands the guest instance; the fn-def-stepped
+    // exception must not narrow this back out.
+    run_ok(
+        "enumerate-over-guest",
+        ENUMERATE_OVER_GUEST_SRC,
+        "enum [(0, 1), (1, 2), (2, 3)]\n",
+    );
+}

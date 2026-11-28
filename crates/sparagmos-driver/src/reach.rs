@@ -1654,7 +1654,15 @@ fn consumer_instance_needs_body(
                 // the adapter instance's body is collected and
                 // its inner `next` edge demands the guest
                 // instance under the foreign-type arm above.
-                || guest_stepped_iterator_ty(ty)
+                // The fn-def-stepped adapter is excepted:
+                // its `next` body hands `Iterator::next`
+                // itself to a helper as a function item, a
+                // value no runtime dispatch serves, so a
+                // collected body cannot run end to end -- the
+                // modelled machine steps their states
+                // directly instead, composing the inner steps
+                // (see `fn_def_stepped_adapter_ty`).
+                || (guest_stepped_iterator_ty(ty) && !fn_def_stepped_adapter_ty(ty))
         } else {
             hash_collection_ty(ty)
                 || collection_collection_ty(ty)
@@ -2113,6 +2121,37 @@ pub fn guest_stepped_iterator_ty(ty: &Ty) -> bool {
         });
     }
     false
+}
+
+/// Whether this type is a core adapter whose `Iterator::next`
+/// body steps the inner iterator through a function item and
+/// whose state the modelled state machine steps end to end
+/// over a guest inner iterator. `Chain`'s `next` passes
+/// `Iterator::next` itself to the `and_then_or_clear` helper
+/// as an `FnOnce` value instead of calling the inner `next`
+/// directly, so a collected body for it cannot run end to
+/// end -- the function item reaches the interpreter as a
+/// value naming the plain trait path, and no runtime
+/// dispatch serves a trait method held as a value. A demand
+/// judgement must therefore not claim `Chain`'s `next` body
+/// on the strength of a guest-stepped inner iterator: the
+/// modelled state machine steps the `Chain` state directly,
+/// composing the two sides' steps (a guest side through its
+/// own collected body, via the machine's unclaimed-tag
+/// fallback). (`Fuse` and `Flatten` share the function-item
+/// source shape, but the machine has no end-to-end step for
+/// them over a guest-stepped composition, so their claiming
+/// is unchanged.) Judged on the head ADT, as the demand pass
+/// consumes the candidate; a reference names the blanket
+/// impl, whose step is the pointee's, so it is peeled first.
+pub fn fn_def_stepped_adapter_ty(ty: &Ty) -> bool {
+    if let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) = guarded_ty_kind(ty) {
+        return fn_def_stepped_adapter_ty(&inner);
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    def.name().as_str() == "std::iter::Chain"
 }
 
 /// Whether this type is a core adapter whose `Iterator::next`
