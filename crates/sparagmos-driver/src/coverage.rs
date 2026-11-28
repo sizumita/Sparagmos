@@ -38,19 +38,28 @@ pub fn instrument_coverage_enabled(tcx: TyCtxt) -> bool {
 /// mention is evidence that the mentioning body's crate uses
 /// the definition in its own code.
 #[derive(Default)]
-struct FnDefMentions {
+struct FnDefMentions<'tcx> {
     defs: Vec<rustc_span::def_id::DefId>,
+    /// The same mentions as raw item instances (definition +
+    /// generic arguments): a mention of a generic function is
+    /// evidence for the specific instantiation it names.
+    instances: Vec<ty::Instance<'tcx>>,
 }
 
-impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for FnDefMentions {
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for FnDefMentions<'tcx> {
     fn visit_ty(
         &mut self,
         ty: ty::Ty<'tcx>,
         _: rustc_middle::mir::visit::TyContext,
     ) {
-        if let ty::TyKind::FnDef(def_id, _) = ty.kind() {
+        if let ty::TyKind::FnDef(def_id, args) = ty.kind() {
             if !self.defs.contains(def_id) {
                 self.defs.push(*def_id);
+            }
+            let instance =
+                ty::Instance::new_raw(*def_id, args.skip_binder());
+            if !self.instances.contains(&instance) {
+                self.instances.push(instance);
             }
         }
         self.super_ty(ty);
@@ -170,6 +179,15 @@ pub fn capture<'tcx>(
         rustc_span::def_id::DefId,
     )> = HashSet::new();
     let mut marked: Vec<ty::Instance<'tcx>> = Vec::new();
+    // Split-record evidence: an instance marked by a body of
+    // its own home crate (its home codegen emits a record for
+    // it) and also marked by a body of another crate or
+    // monomorphised in this crate (this binary's other codegen
+    // emits a second record for the same instance). Native
+    // coverage mappings carry both records; see the split push
+    // in the used-record loop below.
+    let mut home_marked: HashSet<ty::Instance<'tcx>> = HashSet::new();
+    let mut away_marked: HashSet<ty::Instance<'tcx>> = HashSet::new();
     {
         let mut marked_set: HashSet<ty::Instance<'tcx>> = HashSet::new();
         let mut bodies_seen: HashSet<ty::Instance<'tcx>> = HashSet::new();
@@ -253,11 +271,29 @@ pub fn capture<'tcx>(
                     }
                     let mut mentions = FnDefMentions::default();
                     mentions.visit_body(body);
-                    (found, attributed_all, mentions.defs)
+                    (found, attributed_all, mentions)
                 }),
             );
-            if let Ok((found, attributed_all, mentioned)) = walked {
+            if let Ok((found, attributed_all, mentions)) = walked {
                 let walker_crate = instance.def_id().krate;
+                let mentioned = mentions.defs;
+                // A home-crate body that mentions (calls, takes
+                // the pointer of) an instantiation of a function
+                // of its own crate is home usage of that
+                // instantiation: the home codegen monomorphises
+                // it and emits its record. This is the split
+                // evidence for instances whose coverage
+                // statements live in their own body (the
+                // non-inlined shape), where no other home body
+                // carries their statements.
+                for mentioned_instance in &mentions.instances {
+                    if *mentioned_instance != *instance
+                        && mentioned_instance.def_id().krate
+                            == walker_crate
+                    {
+                        home_marked.insert(*mentioned_instance);
+                    }
+                }
                 for attributed in &attributed_all {
                     if *attributed != *instance {
                         home_used
@@ -270,6 +306,20 @@ pub fn capture<'tcx>(
                     }
                 }
                 for attributed in found {
+                    // A body's attribution to itself is not
+                    // home marking: the instance's own body is
+                    // walked whenever any crate demanded it,
+                    // while the home codegen emits its record
+                    // only when a home-crate body uses it (the
+                    // attribution below) or it is a home mono
+                    // item.
+                    if attributed == *instance {
+                        // Self-attribution: no marking either way.
+                    } else if attributed.def_id().krate == walker_crate {
+                        home_marked.insert(attributed);
+                    } else {
+                        away_marked.insert(attributed);
+                    }
                     if marked_set.insert(attributed) {
                         marked.push(attributed);
                     }
@@ -296,7 +346,43 @@ pub fn capture<'tcx>(
             if record.binary_only {
                 binary_crates.insert(instance.def_id().krate);
             }
+            // An instance monomorphised by two crates in this
+            // binary (its home crate's code uses it, and this
+            // crate uses or monomorphises it too) has one
+            // native record per codegen: llvm-cov renders an
+            // instantiation subview for each, with the counts
+            // of the executions in that crate's context. Emit
+            // the home crate's copy as a binary-only duplicate;
+            // the interpreter splits the counts between the
+            // pair by execution context.
+            // The second codegen must be a different crate
+            // from the home one: for a foreign instance, a
+            // local body attributing it or its presence in
+            // this crate's mono partition; for a local
+            // instance, a foreign body attributing it.
+            let split = home_marked.contains(instance)
+                && (away_marked.contains(instance)
+                    || (!instance.def_id().is_local()
+                        && mono_instances.contains(instance)));
+            let copy = if split {
+                let mut copy = record.clone();
+                copy.binary_only = true;
+                copy.split_home_copy = true;
+                Some((copy, file_string.clone()))
+            } else {
+                None
+            };
             used.push((record, file_string));
+            if let Some(copy) = copy {
+                // The foreign unused sweep below enumerates a
+                // crate through its metadata; the local crate
+                // is not enumerable that way (and its unused
+                // records are the local sweep's own business).
+                if !instance.def_id().is_local() {
+                    binary_crates.insert(instance.def_id().krate);
+                }
+                used.push(copy);
+            }
         }
     }
     let mut unused: Vec<(sm::CovFunction, String)> = Vec::new();
@@ -618,6 +704,7 @@ fn prepare<'tcx>(
             name,
             is_used,
             binary_only: false,
+            split_home_copy: false,
             body_names,
             expressions,
             mappings,
@@ -1849,6 +1936,7 @@ mod tests {
             name: name.to_string(),
             is_used: true,
             binary_only: false,
+            split_home_copy: false,
             body_names: Vec::new(),
             expressions: Vec::new(),
             mappings,
@@ -1919,6 +2007,69 @@ mod tests {
         assert!(
             report.contains("  |    1|      2|fn g<T>(x: T) -> T { x }"),
             "f32 subview body:\n{report}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A split pair: two records for one instance (one per
+    /// crate that monomorphised it) share a symbol and a name.
+    /// The main view sums them, and each record gets its own
+    /// instantiation subview with its own count -- the
+    /// `used_with_same_type_...` shape of the coverage suite's
+    /// `uses_crate` / `uses_inline_crate` records.
+    #[test]
+    fn report_renders_split_pair_subviews() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparagmos-cov-split-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("g.rs");
+        std::fs::write(
+            &src,
+            "fn g<T>(x: T) -> T { x }\nfn main() { g::<u32>(1); }\n",
+        )
+        .unwrap();
+        let mut home = function(
+            "g_sym",
+            "test::g::<u32>",
+            vec![code_mapping(0, 1, 1, 1, 25)],
+        );
+        home.binary_only = true;
+        home.split_home_copy = true;
+        let table = sm::CoverageMapping {
+            files: vec![
+                "/workdir".to_string(),
+                src.to_string_lossy().into_owned(),
+            ],
+            functions: vec![
+                function(
+                    "g_sym",
+                    "test::g::<u32>",
+                    vec![code_mapping(0, 1, 1, 1, 25)],
+                ),
+                home,
+                function("main", "test::main", vec![code_mapping(0, 2, 1, 2, 40)]),
+            ],
+        };
+        let counts = vec![vec![1], vec![2], vec![1]];
+        let report = render_report(&table, &counts, false);
+        assert!(
+            report.contains("    1|      3|fn g<T>(x: T) -> T { x }"),
+            "main view sums the pair:\n{report}"
+        );
+        assert_eq!(
+            report.matches("  | test::g::<u32>:").count(),
+            2,
+            "one subview per record of the pair:\n{report}"
+        );
+        assert!(
+            report.contains("  |    1|      1|fn g<T>(x: T) -> T { x }"),
+            "away subview body:\n{report}"
+        );
+        assert!(
+            report.contains("  |    1|      2|fn g<T>(x: T) -> T { x }"),
+            "home subview body:\n{report}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

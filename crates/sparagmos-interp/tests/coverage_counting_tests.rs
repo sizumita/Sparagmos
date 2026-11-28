@@ -38,6 +38,7 @@ fn record(
         name: name.to_string(),
         is_used: true,
         binary_only: false,
+        split_home_copy: false,
         body_names: body_names.iter().map(|s| s.to_string()).collect(),
         expressions: Vec::new(),
         mappings: vec![mir::CovMapping {
@@ -128,4 +129,158 @@ fn expression_terms_evaluate_with_saturating_subtraction() {
     // An unused function's terms all read as zero.
     f.is_used = false;
     assert_eq!(f.term_of(0), mir::CovTerm::Zero);
+}
+
+fn place(idx: u32) -> mir::Place {
+    mir::Place::from_local(mir::Local(idx))
+}
+
+fn fndef_operand(def: mir::DefId) -> mir::Operand {
+    mir::Operand::constant(mir::Constant {
+        literal: mir::ConstKind::Ty(mir::Ty::FnDef(def, Vec::new())),
+        user_ty: None,
+        ty: None,
+        generic_type_ids: None,
+    })
+}
+
+fn call_to(def: mir::DefId, next: u32) -> mir::TerminatorKind {
+    mir::TerminatorKind::Call {
+        func: fndef_operand(def),
+        args: Vec::new(),
+        destination: place(0),
+        target: Some(mir::BasicBlock(next)),
+        unwind: mir::UnwindAction::Continue,
+        call_source: mir::CallSource::Normal,
+    }
+}
+
+/// A body that calls `def` once and returns.
+fn caller_body(def: mir::DefId) -> mir::Body {
+    mir::Body::new(
+        decls(&[unit_ty()]),
+        0,
+        vec![
+            block(Vec::new(), call_to(def, 1)),
+            block(Vec::new(), mir::TerminatorKind::Return),
+        ],
+    )
+}
+
+fn split_pair() -> Vec<mir::CovFunction> {
+    let mut home = record(
+        "generic_sym",
+        "used_crate::generic",
+        &["bin::used_crate::generic"],
+    );
+    home.binary_only = true;
+    home.split_home_copy = true;
+    vec![
+        record(
+            "generic_sym",
+            "used_crate::generic",
+            &["bin::used_crate::generic"],
+        ),
+        home,
+    ]
+}
+
+const GENERIC_DEF: mir::DefId = mir::DefId::new(0, 20);
+const LIB_CALLER_DEF: mir::DefId = mir::DefId::new(0, 21);
+const BIN_CALLER_DEF: mir::DefId = mir::DefId::new(0, 22);
+
+/// The instance `used_crate::generic` is monomorphised by two
+/// crates: the home crate's `lib_caller` calls it once, and the
+/// binary crate's `bin_caller` calls it twice (through `main`).
+/// Its own coverage statement must count the home-context
+/// execution into the home split copy and the other two into
+/// the away record -- the two records llvm-cov renders as two
+/// instantiation subviews (the `uses_crate` shape).
+#[test]
+fn split_pair_counts_own_statement_by_caller_crate() {
+    let generic = mir::Body::new(
+        decls(&[unit_ty()]),
+        0,
+        vec![block(
+            vec![coverage_stmt(0)],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // bin_caller calls the generic twice: bb0 -> bb1 -> bb2.
+    let bin_caller = mir::Body::new(
+        decls(&[unit_ty()]),
+        0,
+        vec![
+            block(Vec::new(), call_to(GENERIC_DEF, 1)),
+            block(Vec::new(), call_to(GENERIC_DEF, 2)),
+            block(Vec::new(), mir::TerminatorKind::Return),
+        ],
+    );
+    let main = mir::Body::new(
+        decls(&[unit_ty()]),
+        0,
+        vec![
+            block(Vec::new(), call_to(LIB_CALLER_DEF, 1)),
+            block(Vec::new(), call_to(BIN_CALLER_DEF, 2)),
+            block(Vec::new(), mir::TerminatorKind::Return),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("bin::used_crate::generic", GENERIC_DEF, generic);
+    prog.add_with_def_id(
+        "bin::used_crate::lib_caller",
+        LIB_CALLER_DEF,
+        caller_body(GENERIC_DEF),
+    );
+    prog.add_with_def_id("bin::bin_caller", BIN_CALLER_DEF, bin_caller);
+    prog.add("bin::main", main);
+    prog.coverage = table(split_pair());
+
+    let run = interpret_mir_captured(&prog, "bin::main", vec![]);
+    assert!(run.result.is_ok(), "main runs: {:?}", run.result);
+    assert_eq!(run.coverage_counts, vec![vec![2], vec![1]]);
+}
+
+/// The inlined form of the same split (the `uses_inline_crate`
+/// shape): the generic's coverage statement is inlined into a
+/// home-crate body once and into the binary's `main` twice; the
+/// executing body decides which record of the pair counts.
+#[test]
+fn split_pair_counts_inlined_statement_by_executing_crate() {
+    let mut lib_body = mir::Body::new(
+        decls(&[unit_ty()]),
+        0,
+        vec![block(
+            vec![coverage_stmt(0)],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    lib_body.coverage_owners = vec![Some("generic_sym".to_string())];
+    let mut main_body = mir::Body::new(
+        decls(&[unit_ty()]),
+        0,
+        vec![
+            block(
+                vec![coverage_stmt(0), coverage_stmt(0)],
+                call_to(LIB_CALLER_DEF, 1),
+            ),
+            block(Vec::new(), mir::TerminatorKind::Return),
+        ],
+    );
+    main_body.coverage_owners = vec![
+        Some("generic_sym".to_string()),
+        Some("generic_sym".to_string()),
+    ];
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("bin::used_crate::lib_caller", LIB_CALLER_DEF, lib_body);
+    prog.add("bin::main", main_body);
+    let mut pair = split_pair();
+    for f in &mut pair {
+        f.body_names = Vec::new();
+    }
+    prog.coverage = table(pair);
+
+    let run = interpret_mir_captured(&prog, "bin::main", vec![]);
+    assert!(run.result.is_ok(), "main runs: {:?}", run.result);
+    assert_eq!(run.coverage_counts, vec![vec![2], vec![1]]);
 }

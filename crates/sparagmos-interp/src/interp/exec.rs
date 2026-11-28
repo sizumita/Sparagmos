@@ -2577,6 +2577,8 @@ impl<'a> Interpreter<'a> {
             // with coverage, or this body carries none) count
             // nothing.
             StatementKind::Coverage(bcb, record) => {
+                let inlined =
+                    *record != u32::MAX && *record != u32::MAX - 1;
                 let record = if *record == u32::MAX {
                     self.coverage_by_body.get(&body.name).copied()
                 } else if *record == u32::MAX - 1 {
@@ -2584,6 +2586,45 @@ impl<'a> Interpreter<'a> {
                 } else {
                     Some(*record as usize)
                 };
+                let record = record.map(|record| {
+                    let Some(&(away, home)) =
+                        self.coverage_split_pairs.get(&record)
+                    else {
+                        return record;
+                    };
+                    // A split pair counts an execution into the
+                    // home crate's record when the statement
+                    // runs in a home-crate context, and into
+                    // the other record otherwise. The context
+                    // of a statement inlined from the instance
+                    // is the body it was inlined into; of the
+                    // instance's own statement, the body that
+                    // called it. Program keys prefix every body
+                    // with the root crate's name, so a body's
+                    // own crate is the second segment of its
+                    // key; the home crate is the first segment
+                    // of the record's demangled name.
+                    let context = if inlined {
+                        body.name.as_str()
+                    } else if frames.len() >= 2 {
+                        frames[frames.len() - 2].func.as_str()
+                    } else {
+                        body.name.as_str()
+                    };
+                    let home_crate = self.program.coverage.functions
+                        [record]
+                        .name
+                        .split("::")
+                        .next()
+                        .unwrap_or("");
+                    let context_crate =
+                        context.split("::").nth(1).unwrap_or("");
+                    if context_crate == home_crate {
+                        home
+                    } else {
+                        away
+                    }
+                });
                 if let Some(record) = record {
                     let function = &self.program.coverage.functions[record];
                     if let Some(Some(counter)) =
