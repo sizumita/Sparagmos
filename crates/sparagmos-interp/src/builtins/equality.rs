@@ -179,7 +179,7 @@ fn is_bare_pointee_form(v: &Value) -> bool {
 /// generic argument inside the `Box<..>` (the allocator
 /// argument follows it). `None` when the tag is not a box
 /// tag.
-fn box_pointee_tag(tag: &str) -> Option<&str> {
+pub(crate) fn box_pointee_tag(tag: &str) -> Option<&str> {
     let inner = tag
         .strip_prefix("std::boxed::Box<")
         .or_else(|| tag.strip_prefix("alloc::boxed::Box<"))?;
@@ -963,7 +963,7 @@ impl<'a> Interpreter<'a> {
     /// collection forms end at their element lists instead
     /// (see `is_pathbuf_value`), so their comparisons are
     /// never mistaken for a box's.
-    fn stored_box_pointer(&self, frames: &[Frame], arg: &Value) -> Option<Value> {
+    pub(crate) fn stored_box_pointer(&self, frames: &[Frame], arg: &Value) -> Option<Value> {
         let mut cur = self.resolve_ref(frames, arg).ok()?.into_owned();
         if !matches!(cur, Value::Enum { .. }) {
             return None;
@@ -1038,7 +1038,7 @@ impl<'a> Interpreter<'a> {
     /// such a nest ending in a pointer (a box the model holds
     /// as a bare value has no pointer to extract either: the
     /// resolution already followed it to the pointee).
-    fn box_cmp_pointer(&self, frames: &[Frame], arg: &Value) -> Option<Value> {
+    pub(crate) fn box_cmp_pointer(&self, frames: &[Frame], arg: &Value) -> Option<Value> {
         let mut cur = self.resolve_ref(frames, arg).ok()?.into_owned();
         loop {
             match cur {

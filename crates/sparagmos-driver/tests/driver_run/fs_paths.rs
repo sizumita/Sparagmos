@@ -811,6 +811,104 @@ fn run_mode_pathbuf_sort_component_order() {
     run_ok("path-sort", PATH_SORT_SRC, "path-sort-ok\n");
 }
 
+const BOXED_PATH_CMP_SRC: &str = r#"
+use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
+
+fn bp(s: &str) -> Box<Path> {
+    PathBuf::from(s).into_boxed_path()
+}
+
+fn generic_cmp<T: Ord>(a: &T, b: &T) -> Ordering {
+    a.cmp(b)
+}
+
+fn generic_eq<T: PartialEq>(a: &T, b: &T) -> bool {
+    a == b
+}
+
+fn main() {
+    // Component order: "a" < "a.b" as components, so
+    // "a/c" < "a.b/c"; bytewise '.'(46) < '/'(47) reverses it.
+    assert_eq!(bp("a/c").cmp(&bp("a.b/c")), Ordering::Less);
+    assert!(bp("a/c") < bp("a.b/c"));
+    assert!(bp("a.b/c") > bp("a/c"));
+    assert_eq!(bp("a/c").partial_cmp(&bp("a.b/c")), Some(Ordering::Less));
+    // Component equality: repeated and trailing separators
+    // take no part.
+    assert!(bp("a//b") == bp("a/b"));
+    assert!(bp("a/b/") == bp("a/b"));
+    assert!(bp("a/b") != bp("a/c"));
+    // Through a generic function and through references.
+    assert_eq!(generic_cmp(&bp("a/c"), &bp("a.b/c")), Ordering::Less);
+    assert!(generic_eq(&bp("a//b"), &bp("a/b")));
+    let x = bp("a/c");
+    let y = bp("a.b/c");
+    assert!(&x < &y);
+    // Binary search over a component-ordered vector finds a
+    // component-equal key.
+    let v = vec![bp("/x"), bp("a/c"), bp("a.b/c")];
+    assert_eq!(v.binary_search(&bp("a//c")), Ok(1));
+    // A boxed PathBuf compares by the same component order.
+    let p: Box<PathBuf> = Box::new(PathBuf::from("a/c"));
+    let q: Box<PathBuf> = Box::new(PathBuf::from("a.b/c"));
+    assert_eq!(p.cmp(&q), Ordering::Less);
+    assert!(Box::new(PathBuf::from("a//b")) == Box::new(PathBuf::from("a/b")));
+    println!("boxed-path-cmp-ok");
+}
+"#;
+
+#[test]
+fn run_mode_boxed_path_cmp_component_order() {
+    run_ok("boxed-path-cmp", BOXED_PATH_CMP_SRC, "boxed-path-cmp-ok\n");
+}
+
+const BOXED_PATH_SORT_SRC: &str = r#"
+use std::ffi::OsStr;
+use std::path::Path;
+
+fn strs(v: &[Box<Path>]) -> Vec<String> {
+    v.iter().map(|p| p.to_str().unwrap().to_string()).collect()
+}
+
+fn main() {
+    // Boxes the model's own conversions form record the
+    // pointee type on the allocation, so the generic sort
+    // machinery — whose comparisons carry no type tag —
+    // still orders them by components.
+    let mut v: Vec<Box<Path>> = vec![
+        Box::from(Path::new("a.b/c")),
+        Box::from(Path::new("a/c")),
+        Box::from(Path::new("/x")),
+    ];
+    v.sort();
+    assert_eq!(strs(&v), vec!["/x".to_string(), "a/c".to_string(), "a.b/c".to_string()]);
+    let mut w: Vec<Box<Path>> = vec![Box::from(Path::new("a.b/c")), Box::from(Path::new("a/c"))];
+    w.sort_unstable();
+    assert_eq!(strs(&w), vec!["a/c".to_string(), "a.b/c".to_string()]);
+    // The neighbouring boxed byte-string types keep their
+    // byte order in the same generic machinery.
+    let mut o: Vec<Box<OsStr>> = vec![Box::from(OsStr::new("a/c")), Box::from(OsStr::new("a.b/c"))];
+    o.sort();
+    assert_eq!(
+        o.iter().map(|s| s.to_str().unwrap().to_string()).collect::<Vec<_>>(),
+        vec!["a.b/c".to_string(), "a/c".to_string()]
+    );
+    let mut t: Vec<Box<str>> = vec!["a/c".into(), "a.b/c".into()];
+    t.sort();
+    assert_eq!(t, vec!["a.b/c".into(), "a/c".into()]);
+    let mut u: Vec<Box<[u8]>> = vec![Box::from(&b"a/c"[..]), Box::from(&b"a.b/c"[..])];
+    u.sort();
+    assert_eq!(u[0], Box::from(&b"a.b/c"[..]));
+    println!("boxed-path-sort-ok");
+}
+"#;
+
+#[test]
+fn run_mode_boxed_path_sort_component_order() {
+    run_ok("boxed-path-sort", BOXED_PATH_SORT_SRC, "boxed-path-sort-ok\n");
+}
+
 const PATH_ANCESTORS_SRC: &str = r#"
 use std::path::Path;
 
