@@ -252,6 +252,10 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
         self.note_stdout_use(frames)?;
         let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
+                if self.output_capture_active() {
+                    self.append_output_capture(frames, text.as_bytes())?;
+                    return Ok(Value::Unit);
+                }
                 // std's `print_to` panics when the write
                 // fails; a write-through sink's error is
                 // that failure (see `write_stdout`). The
@@ -287,6 +291,10 @@ impl<'a> Interpreter<'a> {
             Builtin::Eprint => {
                 arity(1)?;
                 let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
+                if self.output_capture_active() {
+                    self.append_output_capture(frames, text.as_bytes())?;
+                    return Ok(Value::Unit);
+                }
                 // std's `print_to` on the error stream
                 // panics when the write fails, as on the
                 // output stream (see `Builtin::Print`).
@@ -297,6 +305,10 @@ impl<'a> Interpreter<'a> {
                     });
                 }
                 Ok(Value::Unit)
+            }
+            Builtin::IoSetOutputCapture => {
+                arity(1)?;
+                Ok(self.set_output_capture(vals[0].clone()))
             }
             Builtin::FfiIdentity => {
                 arity(1)?;

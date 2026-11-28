@@ -649,6 +649,15 @@ pub struct Interpreter<'a> {
     /// [`Interpreter::fire_panic_hook`] prints itself.
     /// Interior-mutable: most execution paths hold only `&self`.
     panic_hook: std::cell::RefCell<Option<Value>>,
+    /// The output captures installed by
+    /// `std::io::set_output_capture`, by thread id: the
+    /// `Arc<Mutex<Vec<u8>>>` value the guest installed on
+    /// that thread. While a thread has one, its `_print` /
+    /// `_eprint` output and its default panic report append
+    /// to the capture's vector instead of the guest's
+    /// standard streams (std's `print_to` diversion).
+    /// Interior-mutable, like `panic_hook`.
+    output_captures: std::cell::RefCell<HashMap<u64, Value>>,
     /// The guest's allocation-error hook, installed by
     /// `std::alloc::set_alloc_error_hook` (the `fn(Layout)`
     /// value as the guest handed it over); `None` is std's
@@ -1714,6 +1723,7 @@ impl<'a> Interpreter<'a> {
             pending_asm_outgoing: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
+            output_captures: std::cell::RefCell::new(HashMap::new()),
             alloc_error_hook: std::cell::RefCell::new(None),
             hook_report_ctx: std::cell::RefCell::new(None),
             backtrace_style: std::cell::RefCell::new(None),
@@ -1833,6 +1843,112 @@ impl<'a> Interpreter<'a> {
         self.error_output.push_str(text);
     }
 
+    /// Install (or, for `None`, remove) the calling thread's
+    /// output capture (see the `output_captures` field): the
+    /// `std::io::set_output_capture` model. Returns the
+    /// capture it replaces, in the call's own `Option` shape.
+    pub(crate) fn set_output_capture(&self, arg: Value) -> Value {
+        let new = match arg {
+            Value::Enum { variant: 1, mut fields } if fields.len() == 1 => {
+                Some(fields.pop().expect("one field"))
+            }
+            _ => None,
+        };
+        let tid = self.current_thread_id();
+        let old = match new {
+            Some(value) => self
+                .output_captures
+                .borrow_mut()
+                .insert(tid, value),
+            None => self.output_captures.borrow_mut().remove(&tid),
+        };
+        match old {
+            Some(value) => some_capture_value(value),
+            None => none_capture_value(),
+        }
+    }
+
+    /// Whether the calling thread currently has an output
+    /// capture installed.
+    pub(crate) fn output_capture_active(&self) -> bool {
+        self.output_captures
+            .borrow()
+            .contains_key(&self.current_thread_id())
+    }
+
+    /// The calling thread's installed output capture, if any.
+    fn output_capture(&self) -> Option<Value> {
+        self.output_captures
+            .borrow()
+            .get(&self.current_thread_id())
+            .cloned()
+    }
+
+    /// Append `bytes` to the calling thread's output capture
+    /// vector (see the `output_captures` field). A capture
+    /// whose vector the model cannot reach is an explicit
+    /// unsupported error, never a silent drop.
+    pub(crate) fn append_output_capture(
+        &self,
+        _frames: &[Frame],
+        bytes: &[u8],
+    ) -> InterpResult<()> {
+        let capture = self.output_capture().ok_or_else(|| {
+            InterpError::UnsupportedTerminator {
+                kind: "runtime support: output capture append with no capture installed"
+                    .to_string(),
+            }
+        })?;
+        self.append_to_capture_value(&capture, bytes)
+    }
+
+    /// Append `bytes` to the `Vec<u8>` inside the capture
+    /// handle `capture` (an `Arc<Mutex<Vec<u8>>>` value): the
+    /// vector lives in the handle's allocation, inside the
+    /// mutex's data cell.
+    fn append_to_capture_value(
+        &self,
+        capture: &Value,
+        bytes: &[u8],
+    ) -> InterpResult<()> {
+        let id = rc_handle_id(capture).ok_or_else(|| {
+            InterpError::UnsupportedTerminator {
+                kind: format!(
+                    "runtime support: output capture over a {} is not modelled",
+                    capture.kind_name()
+                ),
+            }
+        })?;
+        let mut inner = self.alloc_base(id)?;
+        if !append_bytes_in_capture(&mut inner, bytes) {
+            return Err(InterpError::UnsupportedTerminator {
+                kind: "runtime support: output capture vector is not reachable in this model"
+                    .to_string(),
+            });
+        }
+        self.allocs.borrow_mut().insert(id, inner);
+        Ok(())
+    }
+
+    /// Write `text` to the guest's stderr, diverted into the
+    /// calling thread's output capture when one is installed
+    /// (the panic report's channel: std's default hook writes
+    /// through the captured stream). Panic-report call sites
+    /// use this; other error-output writers keep the plain
+    /// stream.
+    pub(crate) fn push_error_output_captured(
+        &mut self,
+        frames: &[Frame],
+        text: &str,
+    ) {
+        if self.output_capture_active()
+            && self.append_output_capture(frames, text.as_bytes()).is_ok()
+        {
+            return;
+        }
+        self.push_error_output(text);
+    }
+
     /// The stack charge of one frame of `body`, in bytes: the
     /// total size of the locals the native frame reserves room
     /// for -- the ones that materialise as stack storage (see
@@ -1936,6 +2052,13 @@ impl<'a> Interpreter<'a> {
         // own answer to a write on an invalid descriptor
         // is success with the bytes dropped (see
         // `write_stdout_partial`).
+        if self.output_capture_active()
+            && matches!(self.desc_route(1), DescRoute::Stdout)
+        {
+            self.append_output_capture(&[], bytes)
+                .map_err(|_| std::io::Error::from_raw_os_error(9))?;
+            return Ok(());
+        }
         match self.desc_route(1) {
             DescRoute::File(id) => {
                 use std::io::Write as _;
@@ -2012,6 +2135,11 @@ impl<'a> Interpreter<'a> {
     ) -> std::io::Result<usize> {
         match self.desc_route(2) {
             DescRoute::Stderr => {
+                if self.output_capture_active() {
+                    self.append_output_capture(&[], bytes)
+                        .map_err(|_| std::io::Error::from_raw_os_error(9))?;
+                    return Ok(bytes.len());
+                }
                 self.push_error_output(
                     &String::from_utf8_lossy(bytes),
                 );
@@ -2209,4 +2337,71 @@ impl<'a> Interpreter<'a> {
 
 pub fn interpret(program: &Program, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
     Interpreter::new(program).run(entry, args)
+}
+
+/// The `Some` shape of a `set_output_capture` return value.
+fn some_capture_value(value: Value) -> Value {
+    Value::Enum {
+        variant: 1,
+        fields: vec![value],
+    }
+}
+
+/// The `None` shape of a `set_output_capture` return value.
+fn none_capture_value() -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: Vec::new(),
+    }
+}
+
+/// Append `bytes` to the byte vector inside a capture's
+/// stored value tree: the `ArcInner { strong, weak, data }`
+/// aggregate holds the `Mutex`, whose last field is the data
+/// `UnsafeCell`, whose field 0 is the vector. The search
+/// walks fields last-first (the data field is last at every
+/// layer of that nesting) and appends to the first byte
+/// vector it reaches: an element-list aggregate of byte
+/// values, a sparse vector, or a flat byte block. Returns
+/// whether a vector was found.
+fn append_bytes_in_capture(value: &mut Value, bytes: &[u8]) -> bool {
+    match value {
+        Value::SparseVec { elems, len, cap } => {
+            elems.extend(bytes.iter().map(|b| Value::Uint(*b as u128)));
+            *len += bytes.len() as u128;
+            if *cap < *len {
+                *cap = *len;
+            }
+            true
+        }
+        Value::Bytes(data) => {
+            data.extend_from_slice(bytes);
+            true
+        }
+        Value::Enum { fields, .. } | Value::Tuple(fields) => {
+            let is_byte_list = !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|f| matches!(f, Value::Uint(n) if *n <= 255));
+            if is_byte_list {
+                fields.extend(bytes.iter().map(|b| Value::Uint(*b as u128)));
+                return true;
+            }
+            for field in fields.iter_mut().rev() {
+                if append_bytes_in_capture(field, bytes) {
+                    return true;
+                }
+            }
+            // An empty element list is a byte vector that has
+            // not received a byte yet (the capture starts
+            // empty): accept it once the search above has had
+            // its chance at every richer shape inside.
+            if fields.is_empty() {
+                fields.extend(bytes.iter().map(|b| Value::Uint(*b as u128)));
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
 }

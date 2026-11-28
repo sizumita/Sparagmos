@@ -869,6 +869,7 @@ pub(crate) fn io_lookup(canonical: &str) -> Option<Builtin> {
 pub(crate) fn io_stream_lookup(canonical: &str) -> Option<Builtin> {
     Some(match canonical {
         "std::io::stdout" => Builtin::Stdout,
+        "std::io::set_output_capture" => Builtin::IoSetOutputCapture,
         "std::io::stdin" => Builtin::Stdin,
         "std::io::Stdout::lock" | "std::io::Stderr::lock"
         | "std::io::Stdin::lock" => Builtin::StdStreamLock,
