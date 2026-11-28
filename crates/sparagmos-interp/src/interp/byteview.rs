@@ -732,7 +732,18 @@ impl<'a> Interpreter<'a> {
                     let image = self.union_storage_image(value, name)?;
                     return match image.get(pos) {
                         Some(Some(byte)) => Some(Ok(StorageByte::Byte(*byte))),
-                        Some(None) => Some(Err(ByteVerdict::Uninit)),
+                        // A position the image leaves unwritten
+                        // is indeterminate storage, not an
+                        // uninitialised field: a union's bytes
+                        // are only ever determined where a write
+                        // determined them (the judgement the
+                        // foreign read keeps for a byte-form
+                        // root), and a use of the indeterminate
+                        // byte is judged where it is consumed --
+                        // a scalar construction declines it, an
+                        // aggregate construction carries it as
+                        // the value's own uninitialised span.
+                        Some(None) => Some(Ok(StorageByte::Padding)),
                         None => Some(Err(ByteVerdict::Outside(pos))),
                     };
                 }
@@ -3651,6 +3662,7 @@ impl<'a> Interpreter<'a> {
         access_root: &Ty,
     ) -> Option<Ty> {
         let (birth, projection) = self.target_birth(frames, target)?;
+        let birth = self.foreign_instance_ty(&birth);
         if projection.iter().any(|s| {
             matches!(
                 s,
@@ -3679,6 +3691,25 @@ impl<'a> Interpreter<'a> {
             // storage was born as — a slice is never storage's
             // own type — and its bytes must be extractable.
             (Ty::Array(..) | Ty::Slice(_), Ty::Array(..)) => {
+                self.byte_layout_of_ty(&birth)?;
+            }
+            // A typed aggregate read out of byte storage (the
+            // byte-form `ptr::read` shape): the accessing root
+            // is an ADT with a recorded layout, the birth
+            // storage a byte array whose bytes are extractable.
+            // The extent agreement — the access must fit inside
+            // the storage — is `foreign_span`'s check, as for
+            // the pairs above.
+            (Ty::Adt(access_name), Ty::Array(..)) => {
+                if !self.program().adt_layouts.contains_key(access_name) {
+                    return None;
+                }
+                self.byte_layout_of_ty(&birth)?;
+            }
+            // A tuple read out of byte storage, the same shape
+            // with the tuple's recorded field spans as the
+            // construction (see `construct_from_bytes`).
+            (Ty::Tuple(_), Ty::Array(..)) => {
                 self.byte_layout_of_ty(&birth)?;
             }
             _ => return None,
@@ -3711,11 +3742,23 @@ impl<'a> Interpreter<'a> {
             let last = n + 1 == projection.len();
             match step {
                 RefProj::Field(i) | RefProj::UnionField { idx: i, .. } => {
-                    let union = matches!(step, RefProj::UnionField { .. });
                     let cur = ty.as_ref()?;
                     let Ty::Adt(name) = cur else {
                         return None;
                     };
+                    // A field step into a union prices as a
+                    // union field step however the projection
+                    // spells it: a stored projection records a
+                    // plain field step when the place was formed
+                    // through a body that projects the union's
+                    // field as a field (a `MaybeUninit` payload
+                    // pointer formed by `as_ptr`), and the
+                    // storage fact is the same.
+                    let union = matches!(step, RefProj::UnionField { .. })
+                        || self.adt_is_union(name)
+                        || self.adt_is_union(
+                            name.split('<').next().unwrap_or(name),
+                        );
                     let (fo, fs) = if union {
                         // A union's fields all start at its
                         // base; a field's span is its own size.
@@ -3733,9 +3776,24 @@ impl<'a> Interpreter<'a> {
                         {
                             Some(&(fo, fs)) => (fo, fs),
                             None => {
-                                let fty = self.instance_field_ty(
-                                    name, cur, 0, *i,
-                                )?;
+                                // The field-type table is keyed
+                                // by definition name, so an
+                                // instance-named parent retries
+                                // under its definition's name.
+                                let fty = self
+                                    .instance_field_ty(name, cur, 0, *i)
+                                    .or_else(|| {
+                                        let base = name
+                                            .split('<')
+                                            .next()
+                                            .unwrap_or(name);
+                                        self.instance_field_ty(
+                                            base,
+                                            &Ty::Adt(base.to_string()),
+                                            0,
+                                            *i,
+                                        )
+                                    })?;
                                 (0, self.ty_size(&fty)?)
                             }
                         }
@@ -3799,17 +3857,23 @@ impl<'a> Interpreter<'a> {
     /// reference was created) followed by the steps the
     /// access's place adds past its dereference (formed
     /// against the accessing type). The tail prices over the
-    /// accessing type. A non-empty prefix declines: the steps
-    /// a stored reference carries were formed against the
-    /// type of the place that created it — the birth type for
-    /// an ordinary borrow, an accessing view for a borrow
-    /// taken through one — and nothing at the access records
-    /// which, so a span priced for it could name the wrong
-    /// bytes; such accesses (a reference extracted from a
-    /// transmuted view and used elsewhere) keep the ordinary
-    /// structural path. For a reference to the storage root
-    /// itself the prefix is empty and the tail is the whole
-    /// projection.
+    /// accessing type. When the stored projection is exactly
+    /// the tail, the whole projection prices over the
+    /// accessing type. When it carries a prefix beyond the
+    /// tail, the prefix prices over the birth type — the
+    /// steps a stored reference carries were formed against
+    /// the type of the place that created it, which for an
+    /// ordinary borrow is the birth type — and the access
+    /// must fit inside the birth storage from the prefix's
+    /// position. A
+    /// denomination step (`RefProj::View`) anywhere in the
+    /// projection keeps the decline for the prefix case: the
+    /// steps around it were formed against the view's type,
+    /// whose pricing the birth walk cannot reproduce, so such
+    /// accesses (a reference extracted from a transmuted view
+    /// and used elsewhere) keep the ordinary structural path.
+    /// For a reference to the storage root itself the prefix
+    /// is empty and the tail is the whole projection.
     fn foreign_span(
         &self,
         frames: &[Frame],
@@ -3834,8 +3898,48 @@ impl<'a> Interpreter<'a> {
             .iter()
             .filter(|s| !matches!(s, RefProj::View(_)))
             .count();
-        if step_count != tail_len {
+        if step_count < tail_len {
             return None;
+        }
+        if step_count > tail_len {
+            // The stored projection carries steps past the
+            // access's own tail: a prefix formed against the
+            // birth type when the reference was created (an
+            // element step into the birth array, a field step
+            // into the birth aggregate — a `MaybeUninit`'s
+            // payload field, say). The prefix prices through
+            // the birth type's layouts, the tail through the
+            // accessing type, and the access must fit inside
+            // the birth storage from the prefix's position. A
+            // denomination step (`RefProj::View`) anywhere in
+            // the projection keeps the decline: the steps
+            // around it were formed against the view's type,
+            // whose pricing the birth walk cannot reproduce.
+            if projection
+                .iter()
+                .any(|s| matches!(s, RefProj::View(_)))
+            {
+                return None;
+            }
+            if !matches!(access_root, Ty::Adt(_) | Ty::Tuple(_)) {
+                return None;
+            }
+            let birth_size = usize::try_from(self.ty_size(birth)?).ok()?;
+            let split = projection.len() - tail_len;
+            let (off_prefix, _) =
+                self.access_span(birth, &projection[..split], birth_size)?;
+            let access_extent =
+                usize::try_from(self.ty_size_full(access_root)?).ok()?;
+            let (off_tail, size) = self.access_span(
+                access_root,
+                &projection[split..],
+                access_extent,
+            )?;
+            let off = off_prefix.checked_add(off_tail)?;
+            if off.checked_add(size)? > birth_size {
+                return None;
+            }
+            return Some((off, size));
         }
         let birth_size = usize::try_from(self.ty_size(birth)?).ok()?;
         // The extent of the storage the accessing root ranges
@@ -3858,6 +3962,14 @@ impl<'a> Interpreter<'a> {
             }
             Ty::Array(..) => {
                 let size = usize::try_from(self.ty_size(access_root)?).ok()?;
+                if size > birth_size {
+                    return None;
+                }
+                size
+            }
+            Ty::Tuple(_) => {
+                let size =
+                    usize::try_from(self.ty_size_full(access_root)?).ok()?;
                 if size > birth_size {
                     return None;
                 }
@@ -3970,16 +4082,20 @@ impl<'a> Interpreter<'a> {
     /// are `bytes` (the foreign view's read): a definite byte
     /// per position, `None` where the source storage held
     /// padding there. `None` (the access declines) when the
-    /// type's value cannot be built from bytes here — a tuple
-    /// (whose field offsets are not recorded), a pointer, or
-    /// a byte the construction cannot judge. An ADT value is
+    /// type's value cannot be built from bytes here — a
+    /// pointer, or a byte the construction cannot judge. An
+    /// ADT value is
     /// built by splicing the bytes into an uninitialised
     /// skeleton of the type, so an enum's tag bytes re-form
     /// the skeleton at the variant they name, carrying the
     /// already-spliced payload bytes across; a niche-encoded
     /// enum whose niche window holds a niche variant's
     /// pattern is that variant's value directly.
-    fn construct_from_bytes(&self, ty: &Ty, bytes: &[Option<u8>]) -> Option<Value> {
+    pub(crate) fn construct_from_bytes(
+        &self,
+        ty: &Ty,
+        bytes: &[Option<u8>],
+    ) -> Option<Value> {
         match ty {
             Ty::Bool | Ty::Int(_) | Ty::Uint(_) | Ty::Float(_) => {
                 let mut bits: u128 = 0;
@@ -4008,6 +4124,21 @@ impl<'a> Interpreter<'a> {
                 for i in 0..count {
                     let slice = bytes.get(i * es..(i + 1) * es)?;
                     items.push(self.construct_from_bytes(elem, slice)?);
+                }
+                Some(Value::Tuple(items))
+            }
+            Ty::Tuple(ts) => {
+                // A tuple's fields sit at the declaration-order
+                // layout the value model stores them in (see
+                // `tuple_layout`); each field's span constructs
+                // recursively, as an array's elements do.
+                let (spans, _total) = self.tuple_layout(ts)?;
+                let mut items = Vec::with_capacity(ts.len());
+                for (field, &(off, size)) in ts.iter().zip(spans.iter()) {
+                    let off = usize::try_from(off).ok()?;
+                    let size = usize::try_from(size).ok()?;
+                    let slice = bytes.get(off..off + size)?;
+                    items.push(self.construct_from_bytes(field, slice)?);
                 }
                 Some(Value::Tuple(items))
             }
@@ -4125,7 +4256,28 @@ impl<'a> Interpreter<'a> {
     /// declared type is its field type at variant 0). `None`
     /// when the walk meets a step it cannot type.
     fn foreign_access_root(&self, body: &Body, place: &Place) -> Option<Ty> {
-        self.foreign_place_walk(body, place).map(|(root, _)| root)
+        self.foreign_place_walk(body, place)
+            .map(|(root, _)| self.foreign_instance_ty(&root))
+    }
+
+    /// An ADT type named by its bare definition, upgraded to
+    /// the one recorded instance of that definition when the
+    /// bare name itself has no recorded layout and the
+    /// instance is unambiguous (see `adt_instance_key`): the
+    /// byte machinery is keyed by instance, so a root type
+    /// that stays a bare definition name — a generic wrapper
+    /// whose generic arguments the IR types drop
+    /// (`MaybeUninit`, `Unaligned`) — cannot be priced or
+    /// constructed. Any other type is returned as it stands.
+    fn foreign_instance_ty(&self, ty: &Ty) -> Ty {
+        if let Ty::Adt(name) = ty {
+            if !self.program().adt_layouts.contains_key(name) {
+                if let Some(key) = self.adt_instance_key(name) {
+                    return Ty::Adt(key);
+                }
+            }
+        }
+        ty.clone()
     }
 
     /// The declared type of the value a place denotes, for
@@ -4136,7 +4288,8 @@ impl<'a> Interpreter<'a> {
     /// (`place_result_ty` cannot serve here: it prices no
     /// field step into an ADT.)
     fn foreign_place_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
-        self.foreign_place_walk(body, place).map(|(_, ty)| ty)
+        self.foreign_place_walk(body, place)
+            .map(|(_, ty)| self.foreign_instance_ty(&ty))
     }
 
     /// The walk behind [`Self::foreign_access_root`] and
@@ -4747,6 +4900,75 @@ impl<'a> Interpreter<'a> {
         Some(items)
     }
 
+    /// Whether the target's root already holds the accessed
+    /// place's value in typed form, for a union birth: the
+    /// ordinary structural projection of the root value
+    /// through the target's stored projection reaches a value
+    /// of the place's type. A union's fields all denote the
+    /// same storage, so when the union currently holds the
+    /// very type being accessed, the access is the union's own
+    /// typed access — the ordinary path's judgement, which is
+    /// exact — not a view over the storage's bytes: the byte
+    /// walk cannot judge the positions the held value's own
+    /// variant leaves undetermined (the tail past a narrower
+    /// payload reads as uninitialised storage there). The
+    /// view serves the union accesses whose held form does
+    /// not already denote the value: byte storage, and the
+    /// scalar forms a byte-denominated write left in the
+    /// field. Non-union births keep the view's judgement
+    /// unchanged: a reinterpretation between two denominations
+    /// of one storage is the view's own case.
+    /// Whether the resolved target's own projection descends
+    /// into a union (carries a union-field step).
+    fn target_descends_into_union(&self, target: &Resolved) -> bool {
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection,
+            _ => return false,
+        };
+        projection
+            .iter()
+            .any(|step| matches!(step, RefProj::UnionField { .. }))
+    }
+
+    /// Whether the birth type is a union, under its instance
+    /// name or its definition's name (the shape tables are
+    /// keyed by definition, the foreign types by instance).
+    fn foreign_birth_is_union(&self, birth: &Ty) -> bool {
+        let Ty::Adt(name) = birth else {
+            return false;
+        };
+        self.adt_is_union(name)
+            || self.adt_is_union(name.split('<').next().unwrap_or(name))
+    }
+
+    fn foreign_root_holds_typed(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        root: &Value,
+        birth: &Ty,
+        place_ty: &Ty,
+    ) -> bool {
+        if !self.foreign_birth_is_union(birth) {
+            return false;
+        }
+        let Some((_, projection)) = self.target_birth(frames, target) else {
+            return false;
+        };
+        match self.project_value_t(
+            root.clone(),
+            &projection,
+            "",
+            "",
+            Some(birth.clone()),
+        ) {
+            Ok(value) => value_fits_ty(&value, place_ty),
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn foreign_read(
         &self,
         frames: &[Frame],
@@ -4775,6 +4997,9 @@ impl<'a> Interpreter<'a> {
                 }
                 size
             }
+            Ty::Tuple(_) => {
+                usize::try_from(self.ty_size_full(&place_ty)?).ok()?
+            }
             _ => usize::try_from(self.ty_size(&place_ty)?).ok()?,
         };
         if value_size > size {
@@ -4782,12 +5007,26 @@ impl<'a> Interpreter<'a> {
         }
         let size = value_size;
         let root = self.target_root_value(frames, target)?;
+        if self.foreign_root_holds_typed(frames, target, &root, &birth, &place_ty) {
+            return None;
+        }
         let layout = self.byte_layout_of_ty(&birth)?;
+        // A root in byte form (`Value::UnionBytes`) holds its
+        // storage as bytes a write determined or left unwritten:
+        // an unwritten byte there is indeterminate storage the
+        // construction judges like padding (a byte-form write of
+        // a typed value leaves the positions the value does not
+        // determine — the tail past a narrower variant's
+        // payload — unwritten), not an uninitialised field of a
+        // typed value. A typed root's undetermined byte keeps
+        // the uninitialised-read verdict below.
+        let byte_form_root = matches!(root, Value::UnionBytes { .. });
         let mut bytes = Vec::with_capacity(size);
         for i in 0..size {
             match self.foreign_byte(&root, &layout, off + i)? {
                 ForeignByte::Byte(b) => bytes.push(Some(b)),
                 ForeignByte::Padding => bytes.push(None),
+                ForeignByte::Uninit if byte_form_root => bytes.push(None),
                 ForeignByte::Uninit => {
                     let (func, desc) = self.target_desc(frames, target);
                     return Some(Err(InterpError::UninitializedRead {
@@ -4812,7 +5051,53 @@ impl<'a> Interpreter<'a> {
             }
             _ => self.construct_from_bytes(&place_ty, &bytes),
         };
-        built.map(Ok)
+        match built {
+            Some(value) => Some(Ok(value)),
+            None => self
+                .foreign_invalid_tag_error(&place_ty, &bytes)
+                .map(Err),
+        }
+    }
+
+    /// The validity error a foreign read reports when its
+    /// construction declined because the bytes' tag names no
+    /// variant of the enum being read: the value model holds
+    /// no enum value for a discriminant no variant has (see
+    /// `splice_tag_byte`), and the transmute path reports the
+    /// same materialisation the same way (see
+    /// `construct_scalar`'s fieldless-enum arm), so the read
+    /// fails as the validity failure it is instead of leaving
+    /// the ordinary path to misdescribe it as a representation
+    /// mismatch in the assignment that consumes it. `None`
+    /// when the tag names a variant (the decline had another
+    /// cause), the type records no direct tag, or the tag's
+    /// bytes are not all definite.
+    fn foreign_invalid_tag_error(
+        &self,
+        place_ty: &Ty,
+        bytes: &[Option<u8>],
+    ) -> Option<InterpError> {
+        let Ty::Adt(name) = place_ty else {
+            return None;
+        };
+        let tag = self.program().adt_tag_layouts.get(name)?;
+        let off = usize::try_from(tag.offset).ok()?;
+        let size = usize::try_from(tag.size).ok()?;
+        if size == 0 || size > 16 {
+            return None;
+        }
+        let mut bits: u128 = 0;
+        for i in 0..size {
+            bits |= u128::from(*bytes.get(off + i)?.as_ref()?) << (8 * i);
+        }
+        if tag.discriminants.iter().any(|d| *d & ((1u128 << (8 * size)) - 1) == bits) {
+            return None;
+        }
+        Some(InterpError::type_mismatch(
+            format!("byte-form read of {name}"),
+            "a discriminant value of the target enum",
+            format!("bit pattern {bits:#x}"),
+        ))
     }
 
     /// Set an enum place's discriminant through a foreign
@@ -4838,6 +5123,12 @@ impl<'a> Interpreter<'a> {
     ) -> Option<InterpResult<()>> {
         let access_root = self.foreign_access_root(body, place)?;
         let birth = self.foreign_birth_ty(frames, target, &access_root)?;
+        // A union birth's discriminant is the union's own
+        // machinery's judgement, as for a write (see
+        // `foreign_write`).
+        if self.foreign_birth_is_union(&birth) {
+            return None;
+        }
         let (off, _size) =
             self.foreign_span(frames, body, target, &access_root, &birth, place)?;
         let place_ty = self.foreign_place_ty(body, place)?;
@@ -4873,6 +5164,19 @@ impl<'a> Interpreter<'a> {
                 return None;
             };
         let root = self.target_root_value(frames, target)?;
+        // A wholly uninitialised root is the ordinary
+        // write's: it stores the value whole, where a splice
+        // of the value's definite bytes would leave the
+        // positions the value does not determine (its
+        // padding) uninitialised in the composed storage,
+        // and a later full-extent read of that storage could
+        // not judge them.
+        if root == Value::Uninit {
+            return None;
+        }
+        if self.foreign_root_holds_typed(frames, target, &root, &birth, &place_ty) {
+            return None;
+        }
         let layout = self.byte_layout_of_ty(&birth)?;
         let mut composed = root;
         for (i, byte) in bytes.iter().enumerate() {
@@ -4910,6 +5214,23 @@ impl<'a> Interpreter<'a> {
     ) -> Option<InterpResult<()>> {
         let access_root = self.foreign_access_root(body, place)?;
         let birth = self.foreign_birth_ty(frames, target, &access_root)?;
+        // A union birth's storage is the union's own: writing
+        // the accessed type's value into it is the union write
+        // machinery's judgement, and composing the write as a
+        // byte splice would convert the root to byte form,
+        // which the structural projections that share the root
+        // cannot read back. A write whose accessed type is
+        // itself a union and whose target projection does not
+        // descend into the union is a whole-value store of the
+        // union's own value, the same judgement from the other
+        // side; a write that does descend (a cross-field union
+        // write) is this view's own case and stays.
+        if self.foreign_birth_is_union(&birth)
+            || (self.foreign_birth_is_union(&access_root)
+                && !self.target_descends_into_union(target))
+        {
+            return None;
+        }
         let (off, size) =
             self.foreign_span(frames, body, target, &access_root, &birth, place)?;
         if size == 0 {
@@ -4929,6 +5250,18 @@ impl<'a> Interpreter<'a> {
         let size = value_size;
         let bytes = self.written_value_bytes(value, &place_ty, size)?;
         let root = self.target_root_value(frames, target)?;
+        // A wholly uninitialised root is the ordinary
+        // write's, as in `foreign_set_discriminant`: it
+        // stores the value whole, where a splice of the
+        // value's definite bytes would leave the positions
+        // the value does not determine (its padding)
+        // uninitialised in the composed storage.
+        if root == Value::Uninit {
+            return None;
+        }
+        if self.foreign_root_holds_typed(frames, target, &root, &birth, &place_ty) {
+            return None;
+        }
         let layout = self.byte_layout_of_ty(&birth)?;
         let mut composed = root;
         for (i, b) in bytes.iter().enumerate() {
