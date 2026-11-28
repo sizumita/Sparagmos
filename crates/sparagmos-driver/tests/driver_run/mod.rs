@@ -43,6 +43,7 @@ mod sort;
 mod sync;
 mod tool_interception;
 mod simd_displaced;
+mod simd_value_form;
 mod transmute;
 mod validity_assert;
 mod vec_slice;

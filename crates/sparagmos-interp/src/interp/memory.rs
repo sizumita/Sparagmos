@@ -96,6 +96,57 @@ fn scalar_elem_from_bytes(ty: &Ty, bytes: &[u8]) -> Option<Value> {
     })
 }
 
+/// Whether a value is a leaf scalar: a single datum with no
+/// interior (the uninitialised marker, the unit value, a
+/// boolean, an integer — a `char` rides as one — or a float).
+/// A bulk copy's element that is anything else is a whole
+/// value — an aggregate, a pointer, a string — that fills a
+/// destination position by itself.
+fn is_leaf_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Uninit
+            | Value::Unit
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Uint(_)
+            | Value::Float(_)
+            | Value::Float128(_)
+    )
+}
+
+/// The number of leaf slots in a value's stored form: the
+/// count a fresh slot's payload storage holds for a value of
+/// this shape (a tuple's or an aggregate's fields summed, a
+/// fat reference's base and length, anything else one).
+fn leaf_slot_count(value: &Value) -> usize {
+    match value {
+        Value::Tuple(items) => {
+            items.iter().map(leaf_slot_count).sum()
+        }
+        Value::Enum { fields, .. } => {
+            fields.iter().map(leaf_slot_count).sum()
+        }
+        Value::FatRef { base, .. } => leaf_slot_count(base) + 1,
+        _ => 1,
+    }
+}
+
+/// Whether a stored form carries no initialised content at
+/// all: the uninitialised marker, or an aggregate every field
+/// of which is itself uninitialised. Such a destination holds
+/// no live elements a copy must preserve.
+fn value_all_uninit(value: &Value) -> bool {
+    match value {
+        Value::Uninit => true,
+        Value::Tuple(items) => items.iter().all(value_all_uninit),
+        Value::Enum { fields, .. } => {
+            fields.iter().all(value_all_uninit)
+        }
+        _ => false,
+    }
+}
+
 impl<'a> Interpreter<'a> {
     /// The base value a bulk byte operation reads at `target`:
     /// the resolved value, or -- for a pointer displaced into a
@@ -676,6 +727,99 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Whether the position a resolved target denotes is a
+    /// `MaybeUninit` slot's own position: the target's root is
+    /// a `MaybeUninit` value, or a step on the way to the
+    /// position enters one. The walk follows the same
+    /// field-type table [`Self::target_denoted_ty`] uses. A
+    /// byte-displaced or sub-slice step ends it — such a
+    /// position is denominated in bytes, not in the slot's
+    /// payload — as does a step whose type the table cannot
+    /// follow before any union is entered.
+    fn target_in_maybe_uninit_slot(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        projection: &[RefProj],
+    ) -> bool {
+        let root_ty = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => frames
+                .get(*frame_pos)
+                .and_then(|f| self.program.get(&f.func))
+                .and_then(|b| b.local_tys.get(*local))
+                .cloned(),
+            Resolved::Static { name, .. } => {
+                self.program.static_tys.get(name).cloned()
+            }
+            Resolved::Alloc { id, .. } => self.alloc_ty(*id),
+            Resolved::Value(..) => None,
+        };
+        let Some(mut ty) = root_ty else {
+            return false;
+        };
+        let mut crossed = is_maybe_uninit_ty(&ty);
+        let mut variant = 0usize;
+        for step in projection {
+            // A byte-denominated or synthetic step anywhere on
+            // the way disqualifies the position, crossed or
+            // not: it is not the payload's own position.
+            if matches!(
+                step,
+                RefProj::ByteOffset(_)
+                    | RefProj::Subslice { .. }
+                    | RefProj::VecLen
+            ) {
+                return false;
+            }
+            if crossed {
+                continue;
+            }
+            match step {
+                RefProj::Field(i) | RefProj::UnionField { idx: i, .. } => {
+                    let union = matches!(step, RefProj::UnionField { .. });
+                    let Ty::Adt(name) = &ty else {
+                        return false;
+                    };
+                    let name = name.clone();
+                    let Some(next) = self.instance_field_ty(
+                        &name,
+                        &ty,
+                        if union { 0 } else { variant },
+                        *i,
+                    ) else {
+                        return false;
+                    };
+                    ty = next;
+                    variant = 0;
+                }
+                RefProj::Index(i) => {
+                    ty = match &ty {
+                        Ty::Array(elem, _) => (**elem).clone(),
+                        Ty::Tuple(ts) => match ts.get(*i) {
+                            Some(t) => t.clone(),
+                            None => return false,
+                        },
+                        _ => return false,
+                    };
+                }
+                RefProj::Downcast(v) => {
+                    variant = *v as usize;
+                    continue;
+                }
+                RefProj::View(view_ty) => {
+                    ty = view_ty.clone();
+                }
+                _ => return false,
+            }
+            if is_maybe_uninit_ty(&ty) {
+                crossed = true;
+            }
+        }
+        crossed
+    }
+
     /// `elem` is the copy's element type when the call site knows
     /// it (both call paths take it from the pointer operands'
     /// declared types); with `None` the copy reads the element
@@ -992,7 +1136,10 @@ impl<'a> Interpreter<'a> {
                 // place, an element-shaped aggregate itself). An
                 // unreadable (not yet written) destination is a
                 // buffer being filled: the indexed path is the one
-                // that can create its elements.
+                // that can create its elements — with one
+                // exception, judged below: a count of one carrying
+                // a whole value into a destination that holds no
+                // live content fills that destination whole.
                 let dst_current = self.read_resolved(frames, &dst_target).ok();
                 let dst_projection = match &dst_target {
                     Resolved::Place { projection, .. }
@@ -1003,6 +1150,64 @@ impl<'a> Interpreter<'a> {
                 let dst_union_buffer = self
                     .union_storage_descent(frames, &dst_target, &dst_projection, elem)?
                     .is_some();
+                // The unwritten whole-value destination: the
+                // count is one, the element is a whole value
+                // (anything but a leaf scalar), and the
+                // destination holds no live content — its stored
+                // form is entirely uninitialised, or it cannot be
+                // read at all. That is a fresh slot being filled
+                // whole: the `MaybeUninit` temporary behind
+                // `Simd::load` and `Simd::to_array`, whose payload
+                // storage is denominated in the payload's own
+                // slots (an array payload's slot reads back as a
+                // tuple of uninitialised elements, so the stored
+                // form fits no element type and the judgement
+                // above declines). Writing the element as slot
+                // zero of a fresh sequence instead wraps it in a
+                // one-element tuple beside an uninitialised slot,
+                // a form no consumer denominates as the element.
+                // A leaf-scalar element keeps the indexed path: a
+                // byte copy into an uninitialised array place
+                // replaces one slot of a sequence position, not
+                // the position whole. And the destination must be
+                // a `MaybeUninit` slot's own position: an element
+                // position inside a live buffer can hold an
+                // entirely uninitialised slot too (a sort scratch
+                // buffer's unwritten element, whose buffer reads
+                // back as a tuple of uninitialised wrapper forms),
+                // and its write belongs to the sequence machinery
+                // that knows the position's displacement. The
+                // storage found at the position must also be the
+                // element's own storage: a slot's payload storage
+                // has exactly the element's slot count, while a
+                // sequence position's storage holds every
+                // element's slots (a scratch array of 48 strings
+                // against the one string being written).
+                let unwritten_single = n == 1
+                    && self.target_in_maybe_uninit_slot(
+                        frames,
+                        &dst_target,
+                        &dst_projection,
+                    )
+                    && match (elems.first(), &dst_current) {
+                        (Some(first), Some(cur)) => {
+                            !is_leaf_scalar(first)
+                                && match cur {
+                                    Value::Tuple(items) => {
+                                        value_all_uninit(cur)
+                                            && items.len()
+                                                == leaf_slot_count(
+                                                    first,
+                                                )
+                                    }
+                                    _ => value_all_uninit(cur),
+                                }
+                        }
+                        (Some(first), None) => {
+                            !is_leaf_scalar(first)
+                        }
+                        _ => false,
+                    };
                 let dst_single = match elem {
                     Some(ty) => match &dst_current {
                         Some(cur) => {
@@ -1011,9 +1216,10 @@ impl<'a> Interpreter<'a> {
                                     || value_fits_ty(
                                         self.copy_unwrap(cur),
                                         ty,
-                                    ))
+                                    )
+                                    || unwritten_single)
                         }
-                        None => false,
+                        None => !dst_union_buffer && unwritten_single,
                     },
                     None => {
                         let dst_aggregate = dst_current
