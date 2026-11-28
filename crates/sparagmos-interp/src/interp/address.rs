@@ -1363,20 +1363,35 @@ impl<'a> Interpreter<'a> {
             let mut defs: Vec<Vec<u64>> =
                 vec![vec![0; words]; body.blocks.len()];
             for (bi, block) in body.blocks.iter().enumerate() {
+                // Upward-exposed uses only: a read of a local
+                // the block itself has already defined reads
+                // the block's own value, so it must not make
+                // the local live into the block. The raw
+                // union of a block's reads would mark a local
+                // defined and read in a later block (the
+                // second block-scoped `v`, read by its
+                // borrow) live at every boundary of every
+                // predecessor block, where it interferes
+                // with the first `v` whose range it is
+                // actually disjoint from.
+                let mut defined = vec![0u64; words];
                 for stmt in &block.statements {
-                    statement_liveness(
-                        &stmt.kind,
-                        &mut uses[bi],
-                        &mut defs[bi],
-                        n,
-                    );
+                    let mut su = vec![0u64; words];
+                    let mut sd = vec![0u64; words];
+                    statement_liveness(&stmt.kind, &mut su, &mut sd, n);
+                    for w in 0..words {
+                        uses[bi][w] |= su[w] & !defined[w];
+                        defs[bi][w] |= sd[w];
+                        defined[w] |= sd[w];
+                    }
                 }
-                terminator_liveness(
-                    &block.terminator,
-                    &mut uses[bi],
-                    &mut defs[bi],
-                    n,
-                );
+                let mut tu = vec![0u64; words];
+                let mut td = vec![0u64; words];
+                terminator_liveness(&block.terminator, &mut tu, &mut td, n);
+                for w in 0..words {
+                    uses[bi][w] |= tu[w] & !defined[w];
+                    defs[bi][w] |= td[w];
+                }
             }
             let mut live_in: Vec<Vec<u64>> =
                 vec![vec![0; words]; body.blocks.len()];
@@ -1565,9 +1580,33 @@ impl<'a> Interpreter<'a> {
                     {
                         if destination.projection.is_empty() {
                             let dest = destination.local.0;
-                            for op in args {
-                                if let Some(s) = plain_src(op) {
-                                    absorb_pairs.push((dest, s));
+                            // A call whose return type is a
+                            // plain scalar does not carry the
+                            // reference it consumed: `addr()` /
+                            // `expose_provenance()` turn a
+                            // pointer into a `usize`, and the
+                            // integer that lands in the
+                            // destination cannot be dereferenced
+                            // back into the taken storage, so
+                            // the storage is not kept alive by
+                            // the destination's own (possibly
+                            // very long) range.
+                            let carries = !matches!(
+                                body.local_tys.get(dest),
+                                Some(
+                                    Ty::Unit
+                                        | Ty::Bool
+                                        | Ty::Int(_)
+                                        | Ty::Uint(_)
+                                        | Ty::Float(_)
+                                        | Ty::Never
+                                )
+                            );
+                            if carries {
+                                for op in args {
+                                    if let Some(s) = plain_src(op) {
+                                        absorb_pairs.push((dest, s));
+                                    }
                                 }
                             }
                         }
@@ -1586,17 +1625,64 @@ impl<'a> Interpreter<'a> {
                     break;
                 }
             }
+            // The holders' live points as computed from
+            // def/use alone, snapshotted before any taken
+            // local's extension is added: a taken local's
+            // extension is the union of its holders' ranges,
+            // and reading the extensions of other taken
+            // locals into it would widen it past what any
+            // holder actually spans.
+            let base_points = live_points.clone();
             for (taken, bi, from) in takes {
                 if managed[taken] {
                     continue;
                 }
-                let wide = escapes.contains(&taken)
-                    || (0..n).any(|h| {
-                        carry[h].contains(&taken)
-                            && live_points
-                                .keys()
-                                .any(|&(l, b)| l == h && b != bi)
-                    });
+                // The taken storage stays alive exactly as
+                // long as a holder of the reference does.
+                // A holder in another block used to widen
+                // the extension to every boundary of every
+                // block, which made two block-scoped locals
+                // whose references flow through a call chain
+                // (`ptr::from_ref(&v).addr()`: the pointer
+                // temporary is live into the next block)
+                // interfere with everything -- including
+                // each other -- so they could never share a
+                // slot. The holders' exact live points are
+                // already known, so extend by those instead.
+                // Only a reference that escapes the holder
+                // graph altogether (stored through a
+                // dereference), or one held by a managed
+                // local whose storage hull reaches another
+                // block (managed ranges are hulls, not exact
+                // points), keeps the widen-everywhere
+                // reading.
+                let mut wide = escapes.contains(&taken);
+                let mut holder_points: Vec<(usize, usize)> = Vec::new();
+                if !wide {
+                    for h in 0..n {
+                        if h == taken || !carry[h].contains(&taken) {
+                            continue;
+                        }
+                        if managed[h] {
+                            if hulls[h]
+                                .iter()
+                                .enumerate()
+                                .any(|(b, hull)| b != bi && hull.is_some())
+                            {
+                                wide = true;
+                                break;
+                            }
+                        } else {
+                            for (&(l, b), pts) in &base_points {
+                                if l == h {
+                                    for &pt in pts {
+                                        holder_points.push((b, pt));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if wide {
                     for (bj, block) in body.blocks.iter().enumerate() {
                         let pts = live_points
@@ -1615,6 +1701,13 @@ impl<'a> Interpreter<'a> {
                     for b in from..=block_len {
                         if !pts.contains(&b) {
                             pts.push(b);
+                        }
+                    }
+                    for (b, pt) in holder_points {
+                        let pts =
+                            live_points.entry((taken, b)).or_default();
+                        if !pts.contains(&pt) {
+                            pts.push(pt);
                         }
                     }
                 }
@@ -1700,16 +1793,30 @@ impl<'a> Interpreter<'a> {
             // that holds the local and whose occupants it
             // does not interfere with. Slots are created in
             // offset order, so the scan is in offset order.
-            let mut chosen: Option<usize> = None;
+            // Among the slots a plain first fit could take,
+            // prefer one already holding a local of this
+            // local's own size: sequential temporaries of a
+            // size class land together, which is the slot
+            // the size class's colouring reuses. A larger
+            // slot that merely fits (a pointer temporary's
+            // slot, say) is only the fallback.
+            let mut first_fit: Option<usize> = None;
+            let mut first_fit_same_size: Option<usize> = None;
             for (si, (off, ssize, occupants)) in placed.iter().enumerate() {
                 if *ssize >= size
                     && *off % align == 0
                     && occupants.iter().all(|&o| !interferes(l, o))
                 {
-                    chosen = Some(si);
-                    break;
+                    if first_fit.is_none() {
+                        first_fit = Some(si);
+                    }
+                    if occupants.iter().any(|&o| sizes[o] == Some(size)) {
+                        first_fit_same_size = Some(si);
+                        break;
+                    }
                 }
             }
+            let mut chosen: Option<usize> = first_fit_same_size;
             // Displacement: a slot that holds the local but
             // is blocked only by some of its occupants --
             // the classic case is a short-lived temporary
@@ -1768,6 +1875,27 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 if let Some((si, blockers)) = best {
+                    // Displacement preempts a plain first fit
+                    // only when the contested slot holds a
+                    // non-blocking occupant of this local's
+                    // own size -- a disjoint predecessor in
+                    // its size class (the first block-scoped
+                    // `v` for the second, behind the long-lived
+                    // `usize` that took its address) -- since
+                    // that is the slot the colouring reuses
+                    // for the size class, ahead of an
+                    // unrelated larger slot that merely fits
+                    // (the `ptr::from_ref` temporary's slot in
+                    // the provenance shapes of the same
+                    // family). With no first fit at all,
+                    // displacement is the only reuse and runs
+                    // as before.
+                    let preempt = first_fit.is_none()
+                        || placed[si].2.iter().any(|&o| {
+                            !blockers.contains(&o)
+                                && sizes[o] == Some(size)
+                        });
+                    if preempt {
                     let fsize = blockers
                         .iter()
                         .map(|&b| sizes[b].unwrap_or(0))
@@ -1792,6 +1920,10 @@ impl<'a> Interpreter<'a> {
                         }
                         chosen = Some(si);
                     }
+                    }
+                }
+                if chosen.is_none() {
+                    chosen = first_fit;
                 }
             }
             match chosen {
@@ -5510,6 +5642,142 @@ mod ptr_equality_tests {
         assert_ne!(
             slots[1], slots[2],
             "the long-lived address holder keeps its own slot"
+        );
+    }
+
+    /// The provenance call-chain shape of the same
+    /// family: the address of each block-scoped `v` is
+    /// taken through `ptr::from_ref(&v).addr()`, so the
+    /// reference flows through a pointer temporary that
+    /// stays live into the next block, and the `usize`
+    /// the chain produces (`a`, then `b`) is live across
+    /// the other `v`'s whole range. The taken locals are
+    /// alive exactly over their holders' ranges -- the
+    /// scalar the chain ends in holds no reference -- so
+    /// the two `v`s are disjoint, and the second joins
+    /// the first's slot (displacing the long-lived `a`
+    /// that squats in it) instead of the pointer
+    /// temporary's slot.
+    #[test]
+    fn call_chain_scoped_locals_share() {
+        let mut program = Program::new();
+        let call = |func: &str,
+                    arg: Operand,
+                    dest: usize,
+                    target: usize|
+         -> TerminatorKind {
+            TerminatorKind::Call {
+                func: func.to_string(),
+                args: vec![arg],
+                destination: Place::from_index(dest),
+                target: Some(BasicBlock(target)),
+            }
+        };
+        let ptr_ty = || Ty::Ref(Box::new(Ty::Int(IntTy::I32)));
+        let blocks = vec![
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(2),
+                        Rvalue::Use(Operand::Constant(Constant::Uint(0))),
+                    ),
+                    Statement::assign(
+                        Place::from_index(4),
+                        Rvalue::Ref(Place::from_index(2)),
+                    ),
+                ],
+                call(
+                    "core::ptr::from_ref",
+                    Operand::Copy(Place::from_index(4)),
+                    3,
+                    1,
+                ),
+            ),
+            BasicBlockData::new(
+                vec![],
+                call(
+                    "core::ptr::addr",
+                    Operand::Move(Place::from_index(3)),
+                    1,
+                    2,
+                ),
+            ),
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(6),
+                        Rvalue::Use(Operand::Constant(Constant::Uint(0))),
+                    ),
+                    Statement::assign(
+                        Place::from_index(8),
+                        Rvalue::Ref(Place::from_index(6)),
+                    ),
+                ],
+                call(
+                    "core::ptr::from_ref",
+                    Operand::Copy(Place::from_index(8)),
+                    7,
+                    3,
+                ),
+            ),
+            BasicBlockData::new(
+                vec![],
+                call(
+                    "core::ptr::addr",
+                    Operand::Move(Place::from_index(7)),
+                    5,
+                    4,
+                ),
+            ),
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(9),
+                        Rvalue::Use(Operand::Copy(Place::from_index(1))),
+                    ),
+                    Statement::assign(
+                        Place::from_index(10),
+                        Rvalue::Use(Operand::Copy(Place::from_index(5))),
+                    ),
+                    Statement::assign(
+                        Place::from_index(0),
+                        Rvalue::Use(Operand::Copy(Place::from_index(9))),
+                    ),
+                ],
+                TerminatorKind::Return,
+            ),
+        ];
+        program.add_function(Body::new(
+            "probe::f",
+            0,
+            vec![
+                Ty::Unit,
+                Ty::Uint(UintTy::Usize),
+                Ty::Int(IntTy::I32),
+                ptr_ty(),
+                ptr_ty(),
+                Ty::Uint(UintTy::Usize),
+                Ty::Int(IntTy::I32),
+                ptr_ty(),
+                ptr_ty(),
+                Ty::Uint(UintTy::Usize),
+                Ty::Uint(UintTy::Usize),
+            ],
+            blocks,
+        ));
+        let interp = Interpreter::new(&program);
+        let slots = slots_of(&interp, "probe::f");
+        assert_eq!(
+            slots[2], slots[6],
+            "the two block-scoped locals share a slot"
+        );
+        assert_ne!(
+            slots[1], slots[2],
+            "the long-lived address holder keeps its own slot"
+        );
+        assert_ne!(
+            slots[5], slots[6],
+            "the second address holder keeps its own slot"
         );
     }
 
