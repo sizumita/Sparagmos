@@ -4137,6 +4137,84 @@ fn run_mode_os_string_real_aggregate_fmt_and_pathbuf() {
     );
 }
 
+const OS_STRING_GET_MUT_MAKE_ASCII_SRC: &str = r#"
+use std::ffi::OsString;
+use std::rc::Rc;
+
+fn main() {
+    // `Rc::get_mut` hands out `&mut OsString` over a pointee
+    // stored in its real aggregate form (built by
+    // `with_capacity` plus `push`, its bytes behind the
+    // buffer's raw pointer); folding its case through the
+    // `DerefMut` conversion to `&mut OsStr` rewrites the
+    // bytes the pointee holds.
+    let mut s = OsString::with_capacity(16);
+    s.push("HELLO");
+    let mut rc = Rc::new(s);
+    let m = Rc::get_mut(&mut rc).unwrap();
+    m.make_ascii_lowercase();
+    println!("{:?}", rc.as_os_str());
+    println!("len={}", rc.len());
+}
+"#;
+
+#[test]
+fn run_mode_os_string_get_mut_real_aggregate_make_ascii() {
+    run_ok(
+        "os-string-get-mut-real-aggregate-make-ascii",
+        OS_STRING_GET_MUT_MAKE_ASCII_SRC,
+        "\"hello\"\nlen=5\n",
+    );
+}
+
+const OS_STRING_DEREF_MUT_MAKE_ASCII_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    // `make_ascii_*` through the `DerefMut` conversion of an
+    // `&mut OsString` folds the bytes in place, in either of
+    // the string's shapes: the element form a conversion
+    // builds, and the real aggregate form.
+    let mut a = OsString::from("Hello");
+    a.make_ascii_uppercase();
+    println!("{:?}", a);
+    let mut b = OsString::with_capacity(16);
+    b.push("HeLLo");
+    b.make_ascii_lowercase();
+    println!("{:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_os_string_deref_mut_make_ascii() {
+    run_ok(
+        "os-string-deref-mut-make-ascii",
+        OS_STRING_DEREF_MUT_MAKE_ASCII_SRC,
+        "\"HELLO\"\n\"hello\"\n",
+    );
+}
+
+const BOXED_OS_STR_MAKE_ASCII_SRC: &str = r#"
+use std::ffi::OsString;
+
+fn main() {
+    // A boxed `OsStr` folds its bytes in place as well: its
+    // allocation holds the byte string itself.
+    let mut b = OsString::from("HELLO").into_boxed_os_str();
+    b.make_ascii_lowercase();
+    println!("{:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_os_str_make_ascii() {
+    run_ok(
+        "boxed-os-str-make-ascii",
+        BOXED_OS_STR_MAKE_ASCII_SRC,
+        "\"hello\"\n",
+    );
+}
+
 const OS_STRING_FROM_PATHBUF_SRC: &str = r#"
 use std::ffi::OsString;
 use std::path::PathBuf;

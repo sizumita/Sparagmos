@@ -171,6 +171,13 @@ pub enum Builtin {
     /// receiver's bytes (std's own definition, over the
     /// platform byte string), answered directly.
     OsStrToAsciiLowercase,
+    /// `std::ffi::OsStr::make_ascii_lowercase(&mut self)` /
+    /// `make_ascii_uppercase(&mut self)`: byte-wise ASCII
+    /// case folding of the receiver's bytes in place (the
+    /// flag selects the direction); the receiver is the
+    /// `&mut OsStr` the `DerefMut` model hands out, so the
+    /// fold rewrites the `OsString` place behind it.
+    OsStrMakeAsciiCase(bool),
     /// `std::fs::DirEntry::path(&entry) -> PathBuf`: the full
     /// path the modelled entry was snapshotted with.
     DirEntryPath,
