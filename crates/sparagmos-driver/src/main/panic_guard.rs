@@ -469,6 +469,21 @@ pub(crate) fn fetch_instance_body(
                 return Ok(Some(body));
             }
         }
+        // A body whose fetch died on a wrap/unwrap construct
+        // is retried the same way, through the internal
+        // materialization that erases the wrap/unwrap to the
+        // identity (see ).
+        // A fetch that died on a binder *type* alone also
+        // carries this reason; the retry then finds no
+        // construct, returns None, and the reason stands.
+        if reason == UNSAFE_BINDER_REASON {
+            if let Some(body) = sparagmos_driver::convert::with_body_materialization(
+                &inst.name(),
+                || sparagmos_driver::convert::unsafe_binder_erased_body(inst),
+            ) {
+                return Ok(Some(body));
+            }
+        }
     }
     fetched
 }

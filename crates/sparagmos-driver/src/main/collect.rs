@@ -732,6 +732,31 @@ fn collect() -> ControlFlow<()> {
                         continue;
                     }
                 }
+                if reason == sparagmos_driver::convert::UNSAFE_BINDER_REASON {
+                    if let Some(body) =
+                        sparagmos_driver::convert::with_body_materialization(
+                            &instance.name(),
+                            || {
+                                sparagmos_driver::convert::unsafe_binder_erased_body(
+                                    &instance,
+                                )
+                            },
+                        )
+                    {
+                        convert_local_body(
+                            &mut conv,
+                            &mut report,
+                            &mut bodies,
+                            &mut body_def_ids,
+                            &mut body_def_names,
+                            &mut seed_bodies,
+                            name,
+                            def_id,
+                            body,
+                        );
+                        continue;
+                    }
+                }
                 if reason
                     == sparagmos_driver::convert::BODY_FETCH_NORMALIZE_OVERFLOW
                 {

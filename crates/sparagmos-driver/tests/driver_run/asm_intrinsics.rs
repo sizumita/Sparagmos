@@ -1,7 +1,7 @@
 use super::{Command, fixture, run_driver, run_driver_with_aux, run_ok, summarize_driver, temp_dir};
 
 
-const INTRINSIC_NAMED_UNCONVERTED_SRC: &str = r#"
+const INTRINSIC_NAMED_WRAP_BINDER_SRC: &str = r#"
 #![feature(unsafe_binders)]
 #![allow(incomplete_features)]
 use std::unsafe_binder::wrap_binder;
@@ -18,41 +18,39 @@ fn main() {
 "#;
 
 #[test]
-fn run_mode_unconverted_body_named_like_an_intrinsic_exits_two() {
+fn run_mode_wrap_binder_body_named_like_an_intrinsic_executes() {
     // An ordinary function that merely shares a compiler
-    // intrinsic's name (`atomic_fence`) and whose body failed
-    // conversion (here: skipped for its `wrap_binder!` body,
-    // whose WrapUnsafeBinder conversion Stable MIR leaves
-    // unimplemented) must keep its recorded conversion failure.
-    // The intrinsic fallback serves body-less intrinsic
-    // declarations, never a body that exists; when
-    // `external_builtin` consulted it, this call was diverted to
-    // `Builtin::AtomicFence` and the run silently completed
-    // (exit 0, "main done" printed). (The unconverted-body
-    // vehicle used to be a tail call; those bodies convert since
-    // the internal MIR materialization — see
-    // `run_mode_tail_call_body_is_converted_and_call_executes`.)
+    // intrinsic's name (`atomic_fence`) and whose body wraps a
+    // value with `wrap_binder!`: the wrap's Stable MIR
+    // conversion is unimplemented, so the body materializes
+    // through the compiler's internal MIR with the wrap
+    // erased to the identity (Issue #510), conversion
+    // completes, and the call executes the body's own
+    // computation -- the run completes (exit 0, "main done"
+    // printed) on the strength of the converted body, not by
+    // diverting the call to the intrinsic's builtin. (This
+    // fixture used to pin the opposite outcome -- the body
+    // stayed unconverted and the call exited 2 -- back when
+    // it carried the unconverted-body contract; wrap bodies
+    // convert since the internal MIR materialization, the
+    // same transition tail-call bodies made before them.)
     let dir = temp_dir("intrinsicname");
-    let src = fixture(&dir, "intrinsicname.rs", INTRINSIC_NAMED_UNCONVERTED_SRC);
+    let src = fixture(&dir, "intrinsicname.rs", INTRINSIC_NAMED_WRAP_BINDER_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "calling the unconverted body is unsupported (exit 2), not silently served by the intrinsic's builtin; stdout={stdout} stderr={stderr}"
+        Some(0),
+        "the converted wrap body executes and the run completes; stdout={stdout} stderr={stderr}"
     );
     assert!(
-        stderr.contains("no converted body"),
-        "the reason names the unconverted body: {stderr}"
+        stdout.contains("main done"),
+        "the run completes past the call: {stdout}"
     );
     assert!(
-        stderr.contains("atomic_fence"),
-        "the reason names the skipped function: {stderr}"
-    );
-    assert!(
-        !stdout.contains("main done"),
-        "the run must not complete past the diverted call: {stdout}"
+        !stderr.contains("no converted body"),
+        "the call is not reported as an unconverted body: {stderr}"
     );
 }
 
