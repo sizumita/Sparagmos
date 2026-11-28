@@ -128,9 +128,33 @@ pub(crate) const MAX_CONST_MEMO_ENTRIES: usize = 8192;
 /// allocation cache (see `Converter::alloc_cache`).
 pub(crate) const MAX_CACHED_ALLOC_BYTES: usize = 1 << 28;
 
-/// Pointer width in bytes on the target this driver runs for
+/// Pointer width in bytes on the host this driver runs for
 /// (x86_64); Stable MIR provenance entries are pointer-sized.
 pub(crate) const PTR_SIZE: usize = 8;
+
+/// Pointer width in bytes on the session target, from the
+/// compiler target data layout. Stable MIR allocations store
+/// pointer words (and a fat pointer metadata word) at this
+/// width, which is narrower than the host width on a 32-bit
+/// or 16-bit target: a constant decode that reads a pointer
+/// word at the host width fails on exactly those targets (a
+/// `*mut u32` or `*mut fn(..)` constant naming a static, a
+/// `*mut *mut ()` constant naming a foreign static). Falls
+/// back to the host width when no compiler context is
+/// installed, where the target is the host by construction.
+pub(crate) fn target_ptr_size() -> usize {
+    match compiler_tcx() {
+        Some(tcx) => {
+            let size = tcx.data_layout.pointer_size().bytes() as usize;
+            if size == 0 {
+                PTR_SIZE
+            } else {
+                size
+            }
+        }
+        None => PTR_SIZE,
+    }
+}
 
 /// Byte size and signedness of a layout tag scalar: the stored
 /// discriminant of a directly tagged enum, or the niche-carrying
@@ -152,7 +176,7 @@ pub(crate) fn tag_scalar_size_signed(tag: &rustc_public::abi::Scalar) -> Option<
             };
             Some((size, *signed))
         }
-        Primitive::Pointer(_) => Some((PTR_SIZE, false)),
+        Primitive::Pointer(_) => Some((target_ptr_size(), false)),
         _ => None,
     }
 }
@@ -595,7 +619,8 @@ pub(crate) fn int_ty_size(t: &SmirIntTy) -> Option<usize> {
         SmirIntTy::I8 => 1,
         SmirIntTy::I16 => 2,
         SmirIntTy::I32 => 4,
-        SmirIntTy::I64 | SmirIntTy::Isize => 8,
+        SmirIntTy::I64 => 8,
+        SmirIntTy::Isize => target_ptr_size(),
         SmirIntTy::I128 => 16,
     })
 }
@@ -605,7 +630,8 @@ pub(crate) fn uint_ty_size(t: &SmirUintTy) -> Option<usize> {
         SmirUintTy::U8 => 1,
         SmirUintTy::U16 => 2,
         SmirUintTy::U32 => 4,
-        SmirUintTy::U64 | SmirUintTy::Usize => 8,
+        SmirUintTy::U64 => 8,
+        SmirUintTy::Usize => target_ptr_size(),
         SmirUintTy::U128 => 16,
     })
 }
@@ -700,14 +726,16 @@ fn scalar_elem_layout(ty: &rustc_public::ty::Ty) -> Option<usize> {
             SmirIntTy::I8 => 1,
             SmirIntTy::I16 => 2,
             SmirIntTy::I32 => 4,
-            SmirIntTy::I64 | SmirIntTy::Isize => 8,
+            SmirIntTy::I64 => 8,
+        SmirIntTy::Isize => target_ptr_size(),
             SmirIntTy::I128 => 16,
         }),
         TyKind::RigidTy(RigidTy::Uint(t)) => Some(match t {
             SmirUintTy::U8 => 1,
             SmirUintTy::U16 => 2,
             SmirUintTy::U32 => 4,
-            SmirUintTy::U64 | SmirUintTy::Usize => 8,
+            SmirUintTy::U64 => 8,
+        SmirUintTy::Usize => target_ptr_size(),
             SmirUintTy::U128 => 16,
         }),
         TyKind::RigidTy(RigidTy::Float(SmirFloatTy::F32)) => Some(4),
