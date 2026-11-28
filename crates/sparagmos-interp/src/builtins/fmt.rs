@@ -6390,6 +6390,16 @@ pub(crate) fn fmt_lookup(canonical: &str) -> Option<Builtin> {
         "std::fmt::write" | "core::fmt::write" => Builtin::FmtWrite,
         "std::fmt::format" | "std::fmt::format::format_inner"
         | "alloc::fmt::format::format_inner" => Builtin::Format,
+        // The integer `Display` digit writer (see
+        // `Builtin::FmtNumFmt`): an inherent method on each
+        // unsigned integer type, in the `imp` submodule except
+        // for `u128`, whose impl sits at the `num` level.
+        "core::fmt::num::imp::<impl u8>::_fmt"
+        | "core::fmt::num::imp::<impl u16>::_fmt"
+        | "core::fmt::num::imp::<impl u32>::_fmt"
+        | "core::fmt::num::imp::<impl u64>::_fmt"
+        | "core::fmt::num::imp::<impl usize>::_fmt"
+        | "core::fmt::num::<impl u128>::_fmt" => Builtin::FmtNumFmt,
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
         }
