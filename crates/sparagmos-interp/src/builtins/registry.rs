@@ -1779,6 +1779,22 @@ pub enum Builtin {
     /// `Vec` value (a raw pointer / capacity / length triple)
     /// whose bytes the path readers do not take.
     PathBufNew,
+    /// `std::path::PathBuf::into_boxed_path(self) ->
+    /// Box<Path>`: the path in a fresh box allocation. The
+    /// collected body rebuilds the box from the boxed
+    /// `OsStr`'s raw parts, so the box it leaves wraps the
+    /// buffer allocation the path's vector created, recorded
+    /// as a byte slice: no operand-side signal then
+    /// distinguishes it from a byte-slice box, and a tagless
+    /// comparison (the generic sort machinery) orders it
+    /// bytewise instead of by components. The box this
+    /// builtin builds holds the path's bytes themselves —
+    /// the pointee form every `Box<Path>` consumer reads,
+    /// as the `OsString::into_boxed_os_str` box holds the
+    /// OS string's bytes — with the `Path` pointee type
+    /// recorded on the allocation, the record the path-box
+    /// recognition in comparisons consults.
+    PathBufIntoBoxedPath,
     /// `std::str::from_utf8(&[u8]) -> Result<&str, Utf8Error>`:
     /// a non-inline library method, so no MIR body is available;
     /// the validation is a pure function of the bytes, answered

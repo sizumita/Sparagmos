@@ -909,6 +909,60 @@ fn run_mode_boxed_path_sort_component_order() {
     run_ok("boxed-path-sort", BOXED_PATH_SORT_SRC, "boxed-path-sort-ok\n");
 }
 
+const BOXED_PATH_INTO_SORT_SRC: &str = r#"
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+fn bp(s: &str) -> Box<Path> {
+    PathBuf::from(s).into_boxed_path()
+}
+
+fn strs(v: &[Box<Path>]) -> Vec<String> {
+    v.iter().map(|p| p.to_str().unwrap().to_string()).collect()
+}
+
+fn main() {
+    // Boxes `PathBuf::into_boxed_path` forms carry the
+    // path record the builtin leaves on the allocation,
+    // so the generic sort machinery — whose comparisons
+    // carry no type tag — orders them by components, not
+    // bytewise.
+    let mut v: Vec<Box<Path>> = vec![bp("a.b/c"), bp("a/c"), bp("/x")];
+    v.sort();
+    assert_eq!(strs(&v), vec!["/x".to_string(), "a/c".to_string(), "a.b/c".to_string()]);
+    let mut w: Vec<Box<Path>> = vec![bp("a.b/c"), bp("a/c")];
+    w.sort_unstable();
+    assert_eq!(strs(&w), vec!["a/c".to_string(), "a.b/c".to_string()]);
+    // Binary search over the component-ordered vector
+    // finds a component-equal key.
+    assert_eq!(v.binary_search(&bp("a//c")), Ok(1));
+    // The formation's other consumers read the same box.
+    assert_eq!(bp("a/b").file_name().unwrap().to_str().unwrap(), "b");
+    assert_eq!(format!("{}", bp("e/f").display()), "e/f");
+    assert_eq!(format!("{:?}", bp("g/h")), "\"g/h\"");
+    // The neighbouring boxed byte-string types keep their
+    // byte order in the same generic machinery.
+    let mut o: Vec<Box<OsStr>> = vec![Box::from(OsStr::new("a/c")), Box::from(OsStr::new("a.b/c"))];
+    o.sort();
+    assert_eq!(
+        o.iter().map(|s| s.to_str().unwrap().to_string()).collect::<Vec<_>>(),
+        vec!["a.b/c".to_string(), "a/c".to_string()]
+    );
+    let mut t: Vec<Box<str>> = vec!["a/c".into(), "a.b/c".into()];
+    t.sort();
+    assert_eq!(t, vec!["a.b/c".into(), "a/c".into()]);
+    let mut u: Vec<Box<[u8]>> = vec![Box::from(&b"a/c"[..]), Box::from(&b"a.b/c"[..])];
+    u.sort();
+    assert_eq!(u[0], Box::from(&b"a.b/c"[..]));
+    println!("boxed-path-into-sort-ok");
+}
+"#;
+
+#[test]
+fn run_mode_boxed_path_into_boxed_sort_component_order() {
+    run_ok("boxed-path-into-sort", BOXED_PATH_INTO_SORT_SRC, "boxed-path-into-sort-ok\n");
+}
+
 const PATH_ANCESTORS_SRC: &str = r#"
 use std::path::Path;
 

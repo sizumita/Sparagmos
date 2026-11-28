@@ -148,12 +148,11 @@ impl<'a> Interpreter<'a> {
     /// exact: a
     /// byte-slice box records a slice type, an `OsStr` box
     /// the `OsStr` type, a `str` box `str`, so no other
-    /// box's comparison is claimed. A `Box<Path>` a
-    /// converted body assembled field by field (a
-    /// `PathBuf::into_boxed_path` box) wraps the buffer
-    /// allocation the path's vector created, recorded as
-    /// a byte slice; it carries no path record and is not
-    /// recognised here.
+    /// box's comparison is claimed. The
+    /// `PathBuf::into_boxed_path` formation is modelled by
+    /// a builtin that builds the box over the path's bytes
+    /// with the `Path` type recorded, so it leaves the
+    /// same record and is recognised here as well.
     fn operand_is_path_box(&self, frames: &[Frame], value: &Value) -> bool {
         let Some(ptr) = self.stored_box_pointer(frames, value) else {
             return false;
@@ -1098,6 +1097,7 @@ pub(crate) fn path_lookup(canonical: &str) -> Option<Builtin> {
         "std::path::Path::_with_extension" => Builtin::PathWithExtension,
         "std::path::PathBuf::new" => Builtin::PathBufNew,
         "std::path::PathBuf::with_capacity" => Builtin::PathBufNew,
+        "std::path::PathBuf::into_boxed_path" => Builtin::PathBufIntoBoxedPath,
         _ => return None,
     })
 }
