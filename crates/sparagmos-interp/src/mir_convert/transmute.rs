@@ -514,6 +514,23 @@ impl<'a> Converter<'a> {
                 // them), and the stream arms below key on
                 // the recorded array type.
                 Some(t @ mir::Ty::Array(..)) => Some(t),
+                // An integer constant transmuted to an ADT
+                // likewise: the integer -> ADT arms (a fieldless
+                // enum read through its discriminant table, a
+                // one-field wrapper over one, a single-variant
+                // enum holding the integer as its payload) key on
+                // the source being an integer type, and the
+                // recorded type names it exactly as the type of a
+                // place holding the integer would. Without it the
+                // cast of a literal (`transmute::<u16, Single>(0)`,
+                // whose input arrives as the constant `0`) fell
+                // through every arm to unsupported, where the same
+                // cast of a place converted.
+                Some(t @ (mir::Ty::Int(_) | mir::Ty::Uint(_)))
+                    if matches!(target, mir::Ty::Adt(..)) =>
+                {
+                    Some(t)
+                }
                 _ => None,
             });
         // A byte-string constant in pointer position carries no
