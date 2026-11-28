@@ -55,6 +55,7 @@ extern crate rustc_crate_store;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
+extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_public_bridge;
 extern crate rustc_public;
