@@ -377,6 +377,24 @@ impl<'a> Interpreter<'a> {
                 Value::Ref(_) | Value::FatRef { .. } => true,
                 _ => false,
             };
+            // A fat pointer whose base denotes one element of
+            // a container (an element-entry base: the string
+            // view the `as_os_str` / `as_path` formations leave
+            // over an owner's buffer, a raw-parts or sub-slice
+            // base over `container[i]`) denotes the span of its
+            // carried length from that element on, not the
+            // element itself: following the base would hand the
+            // caller the first element alone (a byte span of
+            // any length mistaken for its one first byte, the
+            // defect pinned on #513). The pointer resolves to
+            // itself, as the self-contained bases above do;
+            // consumers that want the span's elements read
+            // them through `slice_elements`, whose sibling
+            // walk is built on exactly this reading.
+            let follows = follows
+                && !matches!(&*cur, Value::FatRef { base, .. }
+                    if self.deref_value(frames, base)
+                        .is_ok_and(|target| target_ends_at_element(&target)));
             if !follows {
                 break;
             }

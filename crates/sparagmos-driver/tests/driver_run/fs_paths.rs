@@ -1502,3 +1502,106 @@ fn run_mode_path_buf_real_aggregate_clone() {
         "clone=\"banana\"\n",
     );
 }
+
+const ITER_BUILTIN_FORMED_OSSTR_REFS_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+
+fn main() {
+    let sb = OsString::from_vec(b"banana".to_vec());
+    let sa = OsString::from_vec(b"apple".to_vec());
+    let v: Vec<&OsStr> = vec![sb.as_os_str(), sa.as_os_str()];
+    for s in &v {
+        println!("iter {:?}", s);
+    }
+    println!("first {:?}", v.first().unwrap());
+    println!("get {:?}", v.get(1).unwrap());
+    println!("refidx {:?}", &v[0]);
+    let w: Vec<&OsStr> = v.iter().copied().collect();
+    println!("copied {:?} {:?}", w[0], w[1]);
+    for s in &v {
+        println!("enc {:?}", s.as_encoded_bytes());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_iter_builtin_formed_osstr_refs() {
+    // Regression for the defect pinned on #513 (comment
+    // 7226377552): elements formed by the `as_os_str()`
+    // builtin -- a fat pointer whose base denotes the first
+    // byte of the owner's buffer (an element-entry base) --
+    // read back through the slice iterator printed only
+    // their first byte (`"b"` / `"a"`), `first()` / `get()`
+    // and `&v[i]` formatting collapsed the same way, and a
+    // `copied().collect()` load of an element stopped with
+    // `expected Ref(Adt(OsStr)), found unsigned integer`.
+    // Index reads and deref-formed elements were always
+    // correct. The reference resolver followed the fat
+    // pointer's base to the single element it denotes a
+    // position in, discarding the carried length; it now
+    // resolves an element-entry fat pointer to itself, and
+    // the span's consumers read its elements through
+    // `slice_elements`. The expected text is native output.
+    run_ok(
+        "iter-builtin-formed-osstr-refs",
+        ITER_BUILTIN_FORMED_OSSTR_REFS_SRC,
+        "iter \"banana\"\n\
+         iter \"apple\"\n\
+         first \"banana\"\n\
+         get \"apple\"\n\
+         refidx \"banana\"\n\
+         copied \"banana\" \"apple\"\n\
+         enc [98, 97, 110, 97, 110, 97]\n\
+         enc [97, 112, 112, 108, 101]\n",
+    );
+}
+
+const ITER_BUILTIN_FORMED_PATH_REFS_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+
+fn main() {
+    let pb = PathBuf::from("banana");
+    let pa = PathBuf::from("apple");
+    let w: Vec<&Path> = vec![pb.as_path(), pa.as_path()];
+    for p in &w {
+        println!("piter {:?}", p);
+    }
+    println!("pfirst {:?}", w.first().unwrap());
+
+    let s1 = OsString::from_vec(b"x".to_vec());
+    let s0 = OsString::from_vec(Vec::new());
+    let s2 = OsString::from_vec(b"yz".to_vec());
+    let u: Vec<&OsStr> = vec![s1.as_os_str(), s0.as_os_str(), s2.as_os_str()];
+    for s in &u {
+        println!("short {:?}", s);
+    }
+    println!("shortlens {} {} {}", u[0].len(), u[1].len(), u[2].len());
+}
+"#;
+
+#[test]
+fn run_mode_iter_builtin_formed_path_refs_and_short_spans() {
+    // The `as_path()` twin of the #513 pin above, plus the
+    // short-span edges of the same formation: a one-byte
+    // owner's element formatted as the tuple `(120,)` (the
+    // resolver's length-1 denomination of the followed
+    // byte), and an empty owner's element stopped the run
+    // with an index past the end of the stored value (the
+    // follow read the base's element position in a
+    // zero-length buffer). The expected text is native
+    // output.
+    run_ok(
+        "iter-builtin-formed-path-refs",
+        ITER_BUILTIN_FORMED_PATH_REFS_SRC,
+        "piter \"banana\"\n\
+         piter \"apple\"\n\
+         pfirst \"banana\"\n\
+         short \"x\"\n\
+         short \"\"\n\
+         short \"yz\"\n\
+         shortlens 1 0 2\n",
+    );
+}
