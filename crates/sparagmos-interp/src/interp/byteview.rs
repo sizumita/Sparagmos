@@ -1038,12 +1038,25 @@ impl<'a> Interpreter<'a> {
                             if let Some(r) =
                                 self.splice_storage_byte(&mut field, &layout, pos, byte)
                             {
-                                if r.is_ok() {
-                                    if let Value::Enum { fields, .. } = slot {
-                                        fields[f] = field;
+                                match r {
+                                    Ok(()) => {
+                                        if let Value::Enum { fields, .. } = slot {
+                                            fields[f] = field;
+                                        }
+                                        return Some(Ok(()));
                                     }
+                                    // A byte outside the held
+                                    // field's own span is not
+                                    // judged by the field's
+                                    // layout: a union's fields
+                                    // share one storage, so the
+                                    // byte is a cross-field
+                                    // write, which the byte form
+                                    // below prices against the
+                                    // union's whole storage.
+                                    Err(ByteVerdict::Outside(_)) => {}
+                                    Err(v) => return Some(Err(v)),
                                 }
-                                return Some(r);
                             }
                         }
                     }
@@ -1440,6 +1453,14 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         shape: &ScalarShape,
     ) -> Option<InterpResult<Value>> {
+        // A load over a union's storage reinterprets the
+        // union's byte span (see `union_shaped_load`): the
+        // per-byte composition below cannot judge a partly
+        // determined span, whose unwritten bytes arrive as
+        // uninitialised verdicts.
+        if let Some(view) = self.union_shaped_load(frames, target, shape) {
+            return Some(view);
+        }
         let width = (shape.bits() / 8) as usize;
         if width == 0 || width > 16 {
             return None;
@@ -1461,6 +1482,58 @@ impl<'a> Interpreter<'a> {
             return None;
         }
         Some(self.construct_scalar(bits, shape))
+    }
+
+    /// A shaped load whose position is a union's storage
+    /// (consulted by `byte_view_shaped_load`): the load reinterprets
+    /// the union's byte span through the shape, the reading a
+    /// union field read performs (see `union_field_read`) --
+    /// bytes no write determined contribute zero, and a span
+    /// no byte of which is determined is an uninitialised
+    /// read. The byte view's own composition cannot judge the
+    /// partly determined span: its unwritten union bytes
+    /// arrive as uninitialised verdicts, indistinguishable
+    /// from a genuinely uninitialised span. `None` when the
+    /// position is not a union's storage this view prices
+    /// (a step it cannot walk, or a displacement into the
+    /// union rather than a position at its base), leaving
+    /// the load to the other paths.
+    pub(crate) fn union_shaped_load(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        shape: &ScalarShape,
+    ) -> Option<InterpResult<Value>> {
+        let (projection, base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        // The walk prices field steps only: any other step
+        // puts the load inside the union's span rather than
+        // at its base, a position the field reading does
+        // not name.
+        if projection
+            .iter()
+            .any(|s| !matches!(s, RefProj::Field(_) | RefProj::Downcast(_)))
+        {
+            return None;
+        }
+        let value = project_value(base, projection, &func, &place_desc).ok()?;
+        // A union already in its byte form carries its span
+        // directly; no type walk is needed to name it.
+        if let Value::UnionBytes { bytes } = &value {
+            return Some(self.union_bytes_decode(bytes, shape, &func, &place_desc));
+        }
+        let (_, pos_ty, _) = self.projection_storage_offset(&base_ty, projection)?;
+        let Ty::Adt(name) = pos_ty? else {
+            return None;
+        };
+        let key = self
+            .adt_instance_key(&name)
+            .unwrap_or_else(|| name.clone());
+        if !self.adt_is_union(&key) {
+            return None;
+        }
+        let image = self.union_storage_image(&value, &key)?;
+        Some(self.union_bytes_decode(&image, shape, &func, &place_desc))
     }
 
     /// Compose a shaped scalar load at a target's structural

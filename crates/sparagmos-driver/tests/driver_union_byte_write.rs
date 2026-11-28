@@ -685,3 +685,195 @@ fn main() {
         "77\n",
     );
 }
+
+// A plain (non-MaybeUninit) union seeded in a static through
+// its narrow field: the seed constant's allocation leaves the
+// wider field's span only partly initialised, so the constant
+// used to arrive as an erased block and every projection into
+// the static stopped. The seed now decodes structured — the
+// partly initialised field reads as uninitialised — and the
+// byte write past the held field's width composes the union's
+// whole storage image; the punned wide read then decodes from
+// that image with the unwritten byte contributing zero bits.
+#[test]
+fn run_mode_plain_union_static_seed_crossfield_write_punned_read() {
+    run_ok(
+        "plain-union-static-punned",
+        r#"
+use std::cell::UnsafeCell;
+
+union U {
+    a: u8,
+    b: u32,
+}
+
+static CELL: CellU = CellU(UnsafeCell::new(U { a: 0x11 }));
+struct CellU(UnsafeCell<U>);
+unsafe impl Sync for CellU {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(2) = 0xAB;
+        let q = p as *const u32;
+        println!("{:x}", *q);
+    }
+}
+"#,
+        "ab0011\n",
+    );
+}
+
+// The same static seed, read back through the byte pointer:
+// the projection into the static is what the erased seed
+// blocked, for byte reads as much as for the punned read.
+#[test]
+fn run_mode_plain_union_static_seed_crossfield_write_byte_readback() {
+    run_ok(
+        "plain-union-static-byteread",
+        r#"
+use std::cell::UnsafeCell;
+
+union U {
+    a: u8,
+    b: u32,
+}
+
+static CELL: CellU = CellU(UnsafeCell::new(U { a: 0x11 }));
+struct CellU(UnsafeCell<U>);
+unsafe impl Sync for CellU {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(2) = 0xAB;
+        println!("{:x}", *bp.add(2));
+    }
+}
+"#,
+        "ab\n",
+    );
+}
+
+// The same static seed, read back through the union's own
+// wide field after the cross-field byte write.
+#[test]
+fn run_mode_plain_union_static_seed_crossfield_write_field_readback() {
+    run_ok(
+        "plain-union-static-fieldread",
+        r#"
+use std::cell::UnsafeCell;
+
+union U {
+    a: u8,
+    b: u32,
+}
+
+static CELL: CellU = CellU(UnsafeCell::new(U { a: 0x11 }));
+struct CellU(UnsafeCell<U>);
+unsafe impl Sync for CellU {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(2) = 0xAB;
+        println!("{:x}", (*p).b);
+    }
+}
+"#,
+        "ab0011\n",
+    );
+}
+
+// The local form of the same family: the byte write lands
+// past the held (narrow) field's width, so it composes the
+// union's storage image rather than splicing into the held
+// field, and the punned wide read decodes from the image.
+#[test]
+fn run_mode_plain_union_local_crossfield_write_punned_read() {
+    run_ok(
+        "plain-union-local-punned",
+        r#"
+union U {
+    a: u8,
+    b: u32,
+}
+
+fn main() {
+    let mut u = U { a: 0x11 };
+    unsafe {
+        let bp = &mut u as *mut U as *mut u8;
+        *bp.add(2) = 0xAB;
+        let q = &u as *const U as *const u32;
+        println!("{:x}", *q);
+    }
+}
+"#,
+        "ab0011\n",
+    );
+}
+
+// A plain-union constant used as an operand: the constant
+// decodes through the same union judgement as a static seed,
+// so the local copy starts structured and the cross-field
+// byte write and punned read compose as above.
+#[test]
+fn run_mode_plain_union_const_operand_byte_write_punned_read() {
+    run_ok(
+        "plain-union-const-operand",
+        r#"
+union U {
+    a: u8,
+    b: u32,
+}
+
+const U0: U = U { a: 0x11 };
+
+fn main() {
+    let mut u = U0;
+    unsafe {
+        let bp = &mut u as *mut U as *mut u8;
+        *bp.add(2) = 0xAB;
+        let q = &u as *const U as *const u32;
+        println!("{:x}", *q);
+    }
+}
+"#,
+        "ab0011\n",
+    );
+}
+
+// Control: a static plain-union seed written through its
+// wide field is fully determined, decodes as it always did,
+// and a byte write inside the wide field splices into it.
+#[test]
+fn run_mode_plain_union_static_wide_seed_byte_write_field_readback() {
+    run_ok(
+        "plain-union-static-wide-seed",
+        r#"
+use std::cell::UnsafeCell;
+
+union U {
+    a: u8,
+    b: u32,
+}
+
+static CELL: CellU = CellU(UnsafeCell::new(U { b: 0x11223344 }));
+struct CellU(UnsafeCell<U>);
+unsafe impl Sync for CellU {}
+
+fn main() {
+    unsafe {
+        let p = CELL.0.get();
+        let bp = p as *mut u8;
+        *bp.add(1) = 0xAB;
+        println!("{:x}", (*p).b);
+    }
+}
+"#,
+        "1122ab44\n",
+    );
+}

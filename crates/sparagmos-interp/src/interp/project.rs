@@ -521,7 +521,7 @@ impl<'a> Interpreter<'a> {
     /// uncovered bytes as zero, the convention the aggregate
     /// form's cross-field read already keeps for the bytes
     /// past the held field's width.
-    fn union_bytes_decode(
+    pub(crate) fn union_bytes_decode(
         &self,
         bytes: &[Option<u8>],
         shape: &ScalarShape,
