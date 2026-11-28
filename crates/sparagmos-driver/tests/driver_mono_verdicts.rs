@@ -875,6 +875,95 @@ fn codegen_only_prefetch_intrinsic_converts() {
 }
 
 #[test]
+fn codegen_only_gpu_intrinsics_convert() {
+    // The GPU intrinsics must be overridden too, and the
+    // interpreter has no model for them -- but code
+    // generation lowers them to the target's GPU runtime
+    // primitives (rustc_codegen_llvm's `codegen_intrinsic_call`
+    // serves both names), so the calls are shimmed by the
+    // backend the verdict mirrors and convert. The verdict
+    // originally replayed only the interpreter's registry plus
+    // a codegen list without these names and rejected the
+    // valid GPU programs that declare them
+    // (tests/codegen-llvm/amdgpu-dispatch-ptr.rs and
+    // tests/codegen-llvm/gpu-launch-sized-workgroup-memory.rs).
+    let case = Case::new("gpu-codegen-only");
+    let src = case.write(
+        "case.rs",
+        "#![feature(intrinsics)]\n\
+         #[rustc_intrinsic]\n\
+         fn amdgpu_dispatch_ptr() -> *const ();\n\
+         #[rustc_intrinsic]\n\
+         fn gpu_launch_sized_workgroup_mem<T>() -> *mut T;\n\
+         fn main() { unsafe { let _p = amdgpu_dispatch_ptr(); let _m = gpu_launch_sized_workgroup_mem::<i32>(); } }\n",
+    );
+    let (code, _stdout, stderr) = case.convert(&src, &[], true);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn codegen_only_sve_tuple_intrinsics_convert() {
+    // The SVE scalable-tuple intrinsics must be overridden
+    // too, and the interpreter has no scalable-vector value
+    // form -- but code generation lowers them to insertvalue
+    // / extractvalue over the tuple (rustc_codegen_llvm's
+    // `codegen_intrinsic_call` serves all five names), so
+    // the calls are shimmed by the backend the verdict
+    // mirrors and convert. The declarations below repeat
+    // core's own signatures (the compiler checks a local
+    // declaration against its intrinsic list), instantiated
+    // with a scalar stand-in: the verdict is by bare
+    // intrinsic name, exactly as code generation's dispatch
+    // is. (The suite records behind this pin call them with
+    // real scalable vectors, through stdarch's SVE wrappers
+    // and core's `intrinsics::simd::scalable` declarations:
+    // tests/codegen-llvm/scalable-vectors/memcpy.rs,
+    // tests/codegen-llvm/scalable-vectors/tuple-intrinsics.rs
+    // and tests/ui/scalable-vectors/transparent-wrappers.rs.)
+    let decls: [(&str, &str, &str); 5] = [
+        (
+            "sve_tuple_create2",
+            "fn sve_tuple_create2<SVec, SVecTup>(x0: SVec, x1: SVec) -> SVecTup;",
+            "sve_tuple_create2::<f32, f32>(1.0f32, 2.0f32)",
+        ),
+        (
+            "sve_tuple_create3",
+            "fn sve_tuple_create3<SVec, SVecTup>(x0: SVec, x1: SVec, x2: SVec) -> SVecTup;",
+            "sve_tuple_create3::<f32, f32>(1.0f32, 2.0f32, 3.0f32)",
+        ),
+        (
+            "sve_tuple_create4",
+            "fn sve_tuple_create4<SVec, SVecTup>(x0: SVec, x1: SVec, x2: SVec, x3: SVec) -> SVecTup;",
+            "sve_tuple_create4::<f32, f32>(1.0f32, 2.0f32, 3.0f32, 4.0f32)",
+        ),
+        (
+            "sve_tuple_get",
+            "fn sve_tuple_get<SVecTup, SVec, const IDX: i32>(tuple: SVecTup) -> SVec;",
+            "sve_tuple_get::<f32, f32, 0>(1.0f32)",
+        ),
+        (
+            "sve_tuple_set",
+            "fn sve_tuple_set<SVecTup, SVec, const IDX: i32>(tuple: SVecTup, x: SVec) -> SVecTup;",
+            "sve_tuple_set::<f32, f32, 0>(1.0f32, 2.0f32)",
+        ),
+    ];
+    for (name, decl, call) in decls {
+        let case = Case::new(&format!("sve-tuple-{name}"));
+        let src = case.write(
+            "case.rs",
+            &format!(
+                "#![feature(intrinsics)]\n\
+                 #[rustc_intrinsic]\n\
+                 pub unsafe {decl}\n\
+                 fn main() {{ let _x: f32 = unsafe {{ {call} }}; }}\n"
+            ),
+        );
+        let (code, _stdout, stderr) = case.convert(&src, &[], true);
+        assert_eq!(code, 0, "{name} stderr={stderr}");
+    }
+}
+
+#[test]
 fn codegen_only_black_box_intrinsic_converts() {
     // `black_box` must be overridden too, and the
     // interpreter has no model for it — but code

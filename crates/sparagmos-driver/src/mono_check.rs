@@ -502,6 +502,30 @@ fn codegen_served_unmodelled(name: &str) -> bool {
             | "select_unpredictable"
             | "vtable_align"
             | "vtable_size"
+            // The GPU launch intrinsics: code generation
+            // lowers them to the target's GPU runtime
+            // primitives (the dispatch pointer read and the
+            // launch-sized workgroup memory globals of
+            // `codegen_intrinsic_call` in
+            // rustc_codegen_llvm). They are declared in
+            // core's gpu intrinsics module and redeclared by
+            // the GPU tests themselves; the interpreter has
+            // no GPU to launch on, so the calls stay
+            // ordinary conversion skips.
+            | "amdgpu_dispatch_ptr"
+            | "gpu_launch_sized_workgroup_mem"
+            // The SVE scalable-tuple intrinsics: code
+            // generation lowers them to insertvalue /
+            // extractvalue over the tuple of scalable
+            // vectors (`codegen_intrinsic_call` in
+            // rustc_codegen_llvm). The interpreter has no
+            // scalable-vector value form, so the calls stay
+            // ordinary conversion skips.
+            | "sve_tuple_create2"
+            | "sve_tuple_create3"
+            | "sve_tuple_create4"
+            | "sve_tuple_get"
+            | "sve_tuple_set"
     ) {
         return true;
     }
