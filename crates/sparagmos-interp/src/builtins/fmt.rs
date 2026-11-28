@@ -2166,6 +2166,25 @@ impl<'a> Interpreter<'a> {
                         .or_else(|| self.string_from_element_form(value)),
                     },
                     Value::SparseVec { .. } => self.string_from_element_form(value),
+                    // A fat pointer to the string's storage: the
+                    // form a sequence element reader hands back
+                    // for a `str` element whose base denotes a
+                    // region of an aggregate's storage (a DST
+                    // struct's `str` tail field, above all), where
+                    // no reader denominated the base to the string
+                    // itself. Resolve it and judge the pointee
+                    // with the same readers; a pointee that is not
+                    // string data declines, and the slice judgement
+                    // below then stands.
+                    Value::FatRef { .. } => match self.resolve_value(frames, value) {
+                        Ok(Value::Str(text)) => Some(text),
+                        Ok(pointee) => self
+                            .string_from_real_aggregate(frames, &pointee)
+                            .ok()
+                            .flatten()
+                            .or_else(|| self.string_from_element_form(&pointee)),
+                        Err(_) => None,
+                    },
                     // The array form, too: a `str` tail field of
                     // a DST struct over a sized byte array (the
                     // sized twin's storage) reaches the fmt
