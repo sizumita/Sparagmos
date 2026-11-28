@@ -251,6 +251,16 @@ pub enum Builtin {
     /// first is only a size hint; the `write_fmt` text is the
     /// result).
     Format,
+    /// `core::fmt::num::imp::<impl uN>::_fmt` (and the
+    /// `core::fmt::num::<impl u128>::_fmt` inherent form): write
+    /// the unsigned integer's decimal digits right-aligned into
+    /// the caller's `&mut [MaybeUninit<u8>]` buffer and return
+    /// the written suffix as a `&str`. The method is an unstable
+    /// core-internal helper whose MIR body is not encoded in
+    /// the distributed core rlib; at opt-level >= 2 the integer
+    /// `Display` bodies that call it are inlined into guest
+    /// code, which then calls it directly.
+    FmtNumFmt,
     /// `std::fmt::Arguments::from_str(&str)`.
     ArgumentsFromStr,
     /// `std::fmt::Arguments::new(&[u8; N], &[Argument; M])`.

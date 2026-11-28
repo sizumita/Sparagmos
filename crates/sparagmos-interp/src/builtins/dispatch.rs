@@ -1046,6 +1046,58 @@ impl<'a> Interpreter<'a> {
                 let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
                 Ok(Value::Str(text))
             }
+            Builtin::FmtNumFmt => {
+                arity(2)?;
+                // `core::fmt::num`'s `_fmt`: the decimal digits
+                // of the unsigned value, written right-aligned
+                // into the caller's buffer; the result is the
+                // buffer's written suffix as a `&str` -- a fat
+                // reference into the buffer itself, not a copy:
+                // the signed `SpecToString` body hands it to
+                // `String::push_str`, whose inlined form walks
+                // the string's raw parts, so the digits must be
+                // readable through the returned pointer.
+                let value = as_u128(&vals[0], name)?;
+                let digits = value.to_string();
+                let bytes = digits.as_bytes();
+                let Value::FatRef { base, len } = &vals[1] else {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a byte slice pointer",
+                        vals[1].kind_name(),
+                    ));
+                };
+                let offset = (*len as usize)
+                    .checked_sub(bytes.len())
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "builtin {name}: {} digits do not fit the {len}-byte buffer",
+                            bytes.len()
+                        ))
+                    })?;
+                self.write_bytes_into_slice(frames, &vals[1], offset, bytes)?;
+                let step = RefProj::Subslice {
+                    offset,
+                    len: bytes.len(),
+                };
+                let base = match &**base {
+                    Value::Ref(target) => target
+                        .projected(step)
+                        .map(|target| Value::Ref(target)),
+                    other => RefTarget::value(other.clone())
+                        .projected(step)
+                        .map(|target| Value::Ref(target)),
+                }
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "builtin {name}: the buffer pointer denotes no storage"
+                    ))
+                })?;
+                Ok(Value::FatRef {
+                    base: Box::new(base),
+                    len: bytes.len() as u128,
+                })
+            }
             Builtin::ArgumentsFromStr => {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;
